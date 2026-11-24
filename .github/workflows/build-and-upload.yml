@@ -79,12 +79,12 @@ jobs:
           secret_key = os.environ["R2_SECRET_ACCESS_KEY"].strip()
           apk_path = os.environ["APK_PATH"]
           apk_name = os.environ["APK_NAME"]
-          print(f"R2 target lengths: account_id={len(account_id)} bucket={len(bucket)} ak={len(access_key)} sk={len(secret_key)}")
 
           with open(apk_path, "rb") as f:
               payload = f.read()
 
           payload_hash = hashlib.sha256(payload).hexdigest()
+          empty_hash = hashlib.sha256(b"").hexdigest()
           content_type = "application/vnd.android.package-archive"
           host = f"{account_id}.r2.cloudflarestorage.com"
           region = "auto"
@@ -99,20 +99,23 @@ jobs:
               k_service = sign(k_region, service_name)
               return sign(k_service, "aws4_request")
 
-          for object_key in (apk_name, "cinejoytv.apk"):
+          def r2_request(method, object_key, body=None, body_hash=empty_hash, include_content_type=False):
               now = datetime.datetime.now(datetime.timezone.utc)
               amz_date = now.strftime("%Y%m%dT%H%M%SZ")
               date_stamp = now.strftime("%Y%m%d")
               canonical_uri = f"/{bucket}/{object_key}"
-              canonical_headers = (
-                  f"content-type:{content_type}\n"
-                  f"host:{host}\n"
-                  f"x-amz-content-sha256:{payload_hash}\n"
-                  f"x-amz-date:{amz_date}\n"
-              )
-              signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+              sign_headers = {
+                  "host": host,
+                  "x-amz-content-sha256": body_hash,
+                  "x-amz-date": amz_date,
+              }
+              if include_content_type:
+                  sign_headers["content-type"] = content_type
+              sorted_keys = sorted(sign_headers.keys())
+              canonical_headers = "".join(f"{k}:{sign_headers[k]}\n" for k in sorted_keys)
+              signed_headers = ";".join(sorted_keys)
               canonical_request = (
-                  f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+                  f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{body_hash}"
               )
               credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
               string_to_sign = (
@@ -126,30 +129,49 @@ jobs:
                   f"SignedHeaders={signed_headers}, Signature={signature}"
               )
               url = f"https://{host}{canonical_uri}"
-              req = urllib.request.Request(
-                  url,
-                  data=payload,
-                  method="PUT",
-                  headers={
-                      "Content-Type": content_type,
-                      "Host": host,
-                      "x-amz-content-sha256": payload_hash,
-                      "x-amz-date": amz_date,
-                      "Authorization": auth_header,
-                  },
-              )
+              req_headers = {
+                  "Host": host,
+                  "x-amz-content-sha256": body_hash,
+                  "x-amz-date": amz_date,
+                  "Authorization": auth_header,
+              }
+              if include_content_type:
+                  req_headers["Content-Type"] = content_type
+              req = urllib.request.Request(url, data=body, method=method, headers=req_headers)
               try:
                   with urllib.request.urlopen(req, timeout=60) as resp:
-                      if resp.status not in (200, 201, 204):
-                          raise RuntimeError(f"R2 upload failed for {object_key}: status={resp.status}")
-                      print(f"Uploaded {object_key} ({len(payload)} bytes) status={resp.status}")
+                      return resp.status, dict(resp.headers.items())
               except urllib.error.HTTPError as exc:
-                  body = exc.read().decode("utf-8", "replace")
-                  print(f"R2 HTTPError {exc.code} for {object_key}: {body}")
+                  err_body = exc.read().decode("utf-8", "replace")
+                  print(f"R2 HTTPError {exc.code} for {method} {object_key}: {err_body}")
                   raise
+
+          for object_key in (apk_name, "cinejoytv.apk"):
+              status, _ = r2_request(
+                  "PUT",
+                  object_key,
+                  body=payload,
+                  body_hash=payload_hash,
+                  include_content_type=True,
+              )
+              if status not in (200, 201, 204):
+                  raise RuntimeError(f"R2 upload failed for {object_key}: status={status}")
+              print(f"Uploaded {object_key} ({len(payload)} bytes) status={status}")
+
+              head_status, head_headers = r2_request("HEAD", object_key)
+              remote_len = int(
+                  next(
+                      (v for k, v in head_headers.items() if k.lower() == "content-length"),
+                      "-1",
+                  )
+              )
+              if head_status != 200 or remote_len != len(payload):
+                  raise RuntimeError(
+                      f"R2 verification failed for {object_key}: status={head_status} size={remote_len}"
+                  )
+              print(f"Verified {object_key} ({remote_len} bytes) status={head_status}")
+              print(f"Public URL: https://cdn.weao.wtf/{object_key}")
           PY
-          curl -fsSI --retry 5 --retry-delay 2 "https://cdn.weao.wtf/${APK_NAME}"
-          curl -fsSI --retry 5 --retry-delay 2 "https://cdn.weao.wtf/cinejoytv.apk"
 
       - name: Upload APK build artifact
         uses: actions/upload-artifact@v7
