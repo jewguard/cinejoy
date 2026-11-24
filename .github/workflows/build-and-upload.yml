@@ -1,0 +1,158 @@
+name: Build and Upload CineJoy TV APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Configure Android SDK
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          yes | "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${SDK_ROOT}" --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Decode release keystore
+        env:
+          CINEJOY_KEYSTORE_BASE64: ${{ secrets.CINEJOY_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$CINEJOY_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "${RUNNER_TEMP}/cinejoy-release.jks"
+          test -s "${RUNNER_TEMP}/cinejoy-release.jks"
+
+      - name: Build signed release APK
+        env:
+          CINEJOY_KEYSTORE_PATH: ${{ runner.temp }}/cinejoy-release.jks
+          CINEJOY_KEYSTORE_PASSWORD: ${{ secrets.CINEJOY_KEYSTORE_PASSWORD }}
+          CINEJOY_KEY_ALIAS: ${{ secrets.CINEJOY_KEY_ALIAS }}
+          CINEJOY_KEY_PASSWORD: ${{ secrets.CINEJOY_KEY_PASSWORD }}
+        run: sh ./gradlew --no-daemon assembleRelease lintVitalRelease
+
+      - name: Prepare versioned APK filename
+        id: apk
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          APK_NAME="cinejoytv-b${GITHUB_RUN_NUMBER}-${SHORT_SHA}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "${RUNNER_TEMP}/${APK_NAME}"
+          echo "name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "path=${RUNNER_TEMP}/${APK_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK to Cloudflare R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import hmac
+          import os
+          import urllib.error
+          import urllib.request
+
+          account_id = os.environ["R2_ACCOUNT_ID"].strip()
+          if "://" in account_id:
+              account_id = account_id.split("://", 1)[1]
+          account_id = account_id.split("/")[0].split(".")[0].strip()
+          bucket = os.environ["R2_BUCKET"].strip().strip("/")
+          access_key = os.environ["R2_ACCESS_KEY_ID"].strip()
+          secret_key = os.environ["R2_SECRET_ACCESS_KEY"].strip()
+          apk_path = os.environ["APK_PATH"]
+          apk_name = os.environ["APK_NAME"]
+          print(f"R2 target lengths: account_id={len(account_id)} bucket={len(bucket)} ak={len(access_key)} sk={len(secret_key)}")
+
+          with open(apk_path, "rb") as f:
+              payload = f.read()
+
+          payload_hash = hashlib.sha256(payload).hexdigest()
+          content_type = "application/vnd.android.package-archive"
+          host = f"{account_id}.r2.cloudflarestorage.com"
+          region = "auto"
+          service = "s3"
+
+          def sign(key, msg):
+              return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+          def get_signature_key(key, date_stamp, region_name, service_name):
+              k_date = sign(("AWS4" + key).encode("utf-8"), date_stamp)
+              k_region = sign(k_date, region_name)
+              k_service = sign(k_region, service_name)
+              return sign(k_service, "aws4_request")
+
+          for object_key in (apk_name, "cinejoytv.apk"):
+              now = datetime.datetime.now(datetime.timezone.utc)
+              amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+              date_stamp = now.strftime("%Y%m%d")
+              canonical_uri = f"/{bucket}/{object_key}"
+              canonical_headers = (
+                  f"content-type:{content_type}\n"
+                  f"host:{host}\n"
+                  f"x-amz-content-sha256:{payload_hash}\n"
+                  f"x-amz-date:{amz_date}\n"
+              )
+              signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+              canonical_request = (
+                  f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+              )
+              credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+              string_to_sign = (
+                  f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n"
+                  + hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+              )
+              signing_key = get_signature_key(secret_key, date_stamp, region, service)
+              signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+              auth_header = (
+                  f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+                  f"SignedHeaders={signed_headers}, Signature={signature}"
+              )
+              url = f"https://{host}{canonical_uri}"
+              req = urllib.request.Request(
+                  url,
+                  data=payload,
+                  method="PUT",
+                  headers={
+                      "Content-Type": content_type,
+                      "Host": host,
+                      "x-amz-content-sha256": payload_hash,
+                      "x-amz-date": amz_date,
+                      "Authorization": auth_header,
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      if resp.status not in (200, 201, 204):
+                          raise RuntimeError(f"R2 upload failed for {object_key}: status={resp.status}")
+                      print(f"Uploaded {object_key} ({len(payload)} bytes) status={resp.status}")
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", "replace")
+                  print(f"R2 HTTPError {exc.code} for {object_key}: {body}")
+                  raise
+          PY
+          curl -fsSI --retry 5 --retry-delay 2 "https://cdn.weao.wtf/${APK_NAME}"
+          curl -fsSI --retry 5 --retry-delay 2 "https://cdn.weao.wtf/cinejoytv.apk"
+
+      - name: Upload APK build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
