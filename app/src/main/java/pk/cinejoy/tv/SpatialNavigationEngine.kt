@@ -9,47 +9,432 @@ import android.webkit.WebView
 
 object SpatialNavigationEngine {
 
-    private const val PRESET_BOOTSTRAP_SCRIPT = """
+    private const val NETWORK_RESILIENCE_AND_PRESET_SCRIPT = """
 (function() {
+    function isMediaRetryUrl(url) {
+        if (!url) {
+            return false;
+        }
+        var lower = String(url).toLowerCase();
+        var exts = [".m3u8", ".ts", ".m4s", ".mp4", ".vtt", ".srt", ".aac", ".key", "/hls/", "manifest", "segment", "chunk"];
+        for (var i = 0; i < exts.length; i++) {
+            if (lower.indexOf(exts[i]) !== -1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function isRetryableStatus(status) {
+        return status === 408 || status === 429 || (status >= 500 && status <= 599);
+    }
+
+    function computeBackoffDelay(attempt) {
+        var base = Math.min(350 * Math.pow(2, attempt), 5600);
+        return base + Math.floor(Math.random() * 120);
+    }
+
+    if (!window.__cinejoyNetInstalled) {
+        window.__cinejoyNetInstalled = true;
+
+        if (typeof window.fetch === "function") {
+            var origFetch = window.fetch.bind(window);
+            window.fetch = function(input, init) {
+                var url = (typeof input === "string") ? input : (input && input.url ? input.url : "");
+                var method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
+                if (method !== "GET" && method !== "HEAD" && !isMediaRetryUrl(url)) {
+                    return origFetch(input, init);
+                }
+                var maxRetries = isMediaRetryUrl(url) ? 5 : 2;
+                var signal = (init && init.signal) ? init.signal : (input && input.signal ? input.signal : null);
+
+                function execAttempt(attempt) {
+                    if (signal && signal.aborted) {
+                        return origFetch(input, init);
+                    }
+                    return origFetch(input, init).then(function(response) {
+                        if (isRetryableStatus(response.status) && attempt < maxRetries) {
+                            return new Promise(function(resolve, reject) {
+                                var delay = computeBackoffDelay(attempt);
+                                setTimeout(function() {
+                                    execAttempt(attempt + 1).then(resolve, reject);
+                                }, delay);
+                            });
+                        }
+                        return response;
+                    }, function(err) {
+                        if ((signal && signal.aborted) || attempt >= maxRetries) {
+                            throw err;
+                        }
+                        return new Promise(function(resolve, reject) {
+                            var delay = computeBackoffDelay(attempt);
+                            setTimeout(function() {
+                                execAttempt(attempt + 1).then(resolve, reject);
+                            }, delay);
+                        });
+                    });
+                }
+
+                return execAttempt(0);
+            };
+        }
+
+        if (typeof window.XMLHttpRequest === "function") {
+            var OrigXHR = window.XMLHttpRequest;
+            var WrappedXHR = function() {
+                var self = this;
+                var real = new OrigXHR();
+                var openArgs = null;
+                var storedHeaders = [];
+                var sendBody = null;
+                var aborted = false;
+                var attempt = 0;
+                var retryTimer = null;
+                var listeners = {};
+                var propHandlers = {};
+                var currentResponseType = "";
+                var currentTimeout = 0;
+                var currentWithCredentials = false;
+                var currentMimeType = null;
+
+                function shouldRetryRequest() {
+                    if (!openArgs || openArgs.length < 2) {
+                        return false;
+                    }
+                    var method = String(openArgs[0] || "GET").toUpperCase();
+                    var url = String(openArgs[1] || "");
+                    var isAsync = openArgs.length < 3 ? true : (openArgs[2] !== false);
+                    if (!isAsync) {
+                        return false;
+                    }
+                    return isMediaRetryUrl(url) || method === "GET" || method === "HEAD";
+                }
+
+                function getMaxRetries() {
+                    var url = (openArgs && openArgs[1]) ? String(openArgs[1]) : "";
+                    return isMediaRetryUrl(url) ? 5 : 2;
+                }
+
+                function emitEvent(type, evt) {
+                    var fn = propHandlers["on" + type];
+                    if (typeof fn === "function") {
+                        try { fn.call(self, evt); } catch (e) {}
+                    }
+                    var list = listeners[type];
+                    if (list && list.length > 0) {
+                        var copy = list.slice();
+                        for (var i = 0; i < copy.length; i++) {
+                            var entry = copy[i];
+                            try {
+                                if (typeof entry.fn === "function") {
+                                    entry.fn.call(self, evt);
+                                } else if (entry.fn && typeof entry.fn.handleEvent === "function") {
+                                    entry.fn.handleEvent(evt);
+                                }
+                            } catch (e2) {}
+                        }
+                    }
+                }
+
+                function scheduleRetry(fallbackEventType, evt) {
+                    var maxRetries = getMaxRetries();
+                    if (aborted || !shouldRetryRequest() || attempt >= maxRetries) {
+                        emitEvent("readystatechange", evt);
+                        emitEvent(fallbackEventType, evt);
+                        if (fallbackEventType !== "loadend") {
+                            emitEvent("loadend", evt);
+                        }
+                        return true;
+                    }
+                    var delay = computeBackoffDelay(attempt);
+                    attempt++;
+                    retryTimer = setTimeout(function() {
+                        retryTimer = null;
+                        if (aborted) {
+                            return;
+                        }
+                        real = new OrigXHR();
+                        attachRealHandlers(real);
+                        real.open.apply(real, openArgs);
+                        real.responseType = currentResponseType;
+                        real.timeout = currentTimeout;
+                        real.withCredentials = currentWithCredentials;
+                        if (currentMimeType) {
+                            try { real.overrideMimeType(currentMimeType); } catch (eMime) {}
+                        }
+                        for (var h = 0; h < storedHeaders.length; h++) {
+                            try {
+                                real.setRequestHeader(storedHeaders[h][0], storedHeaders[h][1]);
+                            } catch (eHdr) {}
+                        }
+                        real.send(sendBody);
+                    }, delay);
+                    return false;
+                }
+
+                function attachRealHandlers(target) {
+                    var retryPendingForThisInstance = false;
+                    target.onreadystatechange = function(evt) {
+                        if (aborted) {
+                            return;
+                        }
+                        if (target.readyState === 4 && shouldRetryRequest() && isRetryableStatus(target.status) && attempt < getMaxRetries()) {
+                            retryPendingForThisInstance = true;
+                            return;
+                        }
+                        if (!retryPendingForThisInstance) {
+                            emitEvent("readystatechange", evt);
+                        }
+                    };
+                    target.onload = function(evt) {
+                        if (aborted) {
+                            return;
+                        }
+                        if (shouldRetryRequest() && isRetryableStatus(target.status) && attempt < getMaxRetries()) {
+                            retryPendingForThisInstance = true;
+                            scheduleRetry("load", evt);
+                            return;
+                        }
+                        emitEvent("load", evt);
+                    };
+                    target.onerror = function(evt) {
+                        if (aborted) {
+                            return;
+                        }
+                        if (shouldRetryRequest() && attempt < getMaxRetries()) {
+                            retryPendingForThisInstance = true;
+                            scheduleRetry("error", evt);
+                            return;
+                        }
+                        emitEvent("error", evt);
+                    };
+                    target.ontimeout = function(evt) {
+                        if (aborted) {
+                            return;
+                        }
+                        if (shouldRetryRequest() && attempt < getMaxRetries()) {
+                            retryPendingForThisInstance = true;
+                            scheduleRetry("timeout", evt);
+                            return;
+                        }
+                        emitEvent("timeout", evt);
+                    };
+                    target.onabort = function(evt) {
+                        emitEvent("abort", evt);
+                    };
+                    target.onprogress = function(evt) {
+                        if (!retryPendingForThisInstance) {
+                            emitEvent("progress", evt);
+                        }
+                    };
+                    target.onloadstart = function(evt) {
+                        if (attempt === 0) {
+                            emitEvent("loadstart", evt);
+                        }
+                    };
+                    target.onloadend = function(evt) {
+                        if (!retryPendingForThisInstance) {
+                            emitEvent("loadend", evt);
+                        }
+                    };
+                }
+
+                attachRealHandlers(real);
+
+                this.open = function() {
+                    openArgs = Array.prototype.slice.call(arguments);
+                    storedHeaders = [];
+                    aborted = false;
+                    attempt = 0;
+                    if (retryTimer) {
+                        clearTimeout(retryTimer);
+                        retryTimer = null;
+                    }
+                    return real.open.apply(real, openArgs);
+                };
+                this.setRequestHeader = function(name, value) {
+                    storedHeaders.push([name, value]);
+                    return real.setRequestHeader(name, value);
+                };
+                this.send = function(body) {
+                    sendBody = body;
+                    aborted = false;
+                    return real.send(body);
+                };
+                this.abort = function() {
+                    aborted = true;
+                    if (retryTimer) {
+                        clearTimeout(retryTimer);
+                        retryTimer = null;
+                    }
+                    return real.abort();
+                };
+                this.getResponseHeader = function(name) {
+                    return real.getResponseHeader(name);
+                };
+                this.getAllResponseHeaders = function() {
+                    return real.getAllResponseHeaders();
+                };
+                this.overrideMimeType = function(mime) {
+                    currentMimeType = mime;
+                    return real.overrideMimeType(mime);
+                };
+                this.addEventListener = function(type, fn, opts) {
+                    if (!listeners[type]) {
+                        listeners[type] = [];
+                    }
+                    for (var i = 0; i < listeners[type].length; i++) {
+                        if (listeners[type][i].fn === fn) {
+                            return;
+                        }
+                    }
+                    listeners[type].push({ fn: fn, opts: opts });
+                };
+                this.removeEventListener = function(type, fn) {
+                    var list = listeners[type];
+                    if (!list) {
+                        return;
+                    }
+                    for (var i = list.length - 1; i >= 0; i--) {
+                        if (list[i].fn === fn) {
+                            list.splice(i, 1);
+                        }
+                    }
+                };
+
+                Object.defineProperties(this, {
+                    readyState: { get: function() { return real.readyState; } },
+                    status: { get: function() { return real.status; } },
+                    statusText: { get: function() { return real.statusText; } },
+                    response: { get: function() { return real.response; } },
+                    responseText: { get: function() { return real.responseText; } },
+                    responseXML: { get: function() { return real.responseXML; } },
+                    responseURL: { get: function() { return real.responseURL; } },
+                    upload: { get: function() { return real.upload; } },
+                    responseType: {
+                        get: function() { return currentResponseType; },
+                        set: function(v) { currentResponseType = v; real.responseType = v; }
+                    },
+                    timeout: {
+                        get: function() { return currentTimeout; },
+                        set: function(v) { currentTimeout = v; real.timeout = v; }
+                    },
+                    withCredentials: {
+                        get: function() { return currentWithCredentials; },
+                        set: function(v) { currentWithCredentials = !!v; real.withCredentials = !!v; }
+                    }
+                });
+
+                var events = ["readystatechange", "load", "error", "timeout", "abort", "progress", "loadstart", "loadend"];
+                for (var ei = 0; ei < events.length; ei++) {
+                    (function(evName) {
+                        var propName = "on" + evName;
+                        Object.defineProperty(self, propName, {
+                            get: function() { return propHandlers[propName] || null; },
+                            set: function(v) { propHandlers[propName] = v; }
+                        });
+                    })(events[ei]);
+                }
+            };
+            WrappedXHR.UNSENT = OrigXHR.UNSENT;
+            WrappedXHR.OPENED = OrigXHR.OPENED;
+            WrappedXHR.HEADERS_RECEIVED = OrigXHR.HEADERS_RECEIVED;
+            WrappedXHR.LOADING = OrigXHR.LOADING;
+            WrappedXHR.DONE = OrigXHR.DONE;
+            WrappedXHR.prototype = OrigXHR.prototype;
+            window.XMLHttpRequest = WrappedXHR;
+        }
+    }
+
+    window.__cinejoyReleaseMedia = function(preservePos) {
+        try {
+            var videos = document.querySelectorAll("video");
+            var savedTime = 0;
+            for (var i = 0; i < videos.length; i++) {
+                var v = videos[i];
+                if (preservePos && !savedTime && v.currentTime && !isNaN(v.currentTime) && v.currentTime > 1) {
+                    savedTime = v.currentTime;
+                }
+                try { v.pause(); } catch (e1) {}
+                try { v.removeAttribute("src"); } catch (e2) {}
+                try { v.srcObject = null; } catch (e3) {}
+                try { v.load(); } catch (e4) {}
+            }
+            if (preservePos && location.pathname.indexOf("/watch/") !== -1) {
+                sessionStorage.setItem("__cj_bg_resume", JSON.stringify({
+                    path: location.pathname,
+                    time: savedTime,
+                    cleared: true
+                }));
+            }
+        } catch (e) {}
+    };
+
+    window.__cinejoyResumeMedia = function() {
+        try {
+            var raw = sessionStorage.getItem("__cj_bg_resume");
+            if (!raw) {
+                return;
+            }
+            var info = JSON.parse(raw);
+            if (!info || info.path !== location.pathname) {
+                sessionStorage.removeItem("__cj_bg_resume");
+                return;
+            }
+            if (info.cleared) {
+                info.cleared = false;
+                sessionStorage.setItem("__cj_bg_resume", JSON.stringify(info));
+                location.reload();
+                return;
+            }
+            if (info.time && info.time > 1) {
+                var tries = 0;
+                var restoreTimer = setInterval(function() {
+                    tries++;
+                    var vid = document.querySelector("video");
+                    if (vid && vid.readyState >= 1) {
+                        try {
+                            vid.currentTime = info.time;
+                            vid.play();
+                        } catch (eSeek) {}
+                        sessionStorage.removeItem("__cj_bg_resume");
+                        clearInterval(restoreTimer);
+                    } else if (tries >= 25) {
+                        sessionStorage.removeItem("__cj_bg_resume");
+                        clearInterval(restoreTimer);
+                    }
+                }, 250);
+            } else {
+                sessionStorage.removeItem("__cj_bg_resume");
+            }
+        } catch (e) {}
+    };
+
     try {
+        sessionStorage.removeItem("__cj_nav_retry");
         localStorage.setItem("cinejoy_notice_seen", "2026-10-fixed-4k-no-ads");
-        document.documentElement.setAttribute("data-low-power", "on");
-        document.documentElement.setAttribute("data-flat-ui", "on");
-        document.documentElement.setAttribute("data-theme-ambient-bleed", "off");
-        document.documentElement.setAttribute("data-glass-refract", "off");
-
-        var rawSettings = localStorage.getItem("cinejoy_settings");
-        var settings = rawSettings ? JSON.parse(rawSettings) : {};
-        settings.trailersEnabled = false;
-        settings.reduceMotion = true;
-        settings.autoplay = true;
-        localStorage.setItem("cinejoy_settings", JSON.stringify(settings));
-
         var userQuality = sessionStorage.getItem("__cj_user_quality");
         var steppedUrl = sessionStorage.getItem("__cj_stepdown_url");
         var rawPlayer = localStorage.getItem("cinejoy_player_local");
         var playerCfg = rawPlayer ? JSON.parse(rawPlayer) : {};
-        if (userQuality === "auto") {
-            delete playerCfg.quality;
-            playerCfg.mp4Quality = "auto";
-        } else if (userQuality && /^[0-9]+$/.test(userQuality)) {
+        if (userQuality && /^[0-9]+$/.test(userQuality)) {
             playerCfg.quality = parseInt(userQuality, 10);
             playerCfg.mp4Quality = userQuality;
         } else if (steppedUrl === location.pathname) {
-            playerCfg.quality = 1080;
-            playerCfg.mp4Quality = "1080";
+            playerCfg.quality = 720;
+            playerCfg.mp4Quality = "720";
         } else {
-            playerCfg.quality = 2160;
-            playerCfg.mp4Quality = "2160";
+            delete playerCfg.quality;
+            playerCfg.mp4Quality = "auto";
         }
         localStorage.setItem("cinejoy_player_local", JSON.stringify(playerCfg));
     } catch (e) {}
 })();
 """
 
-    private const val FOCUS_POLYFILL_HEAD = """
+    private const val FIRESTICK_NAV_HEAD = """
 (function() {
-    function applyPresets() {
+    function applyTvPresets() {
         try {
             localStorage.setItem("cinejoy_notice_seen", "2026-10-fixed-4k-no-ads");
             document.documentElement.setAttribute("data-low-power", "on");
@@ -63,29 +448,10 @@ object SpatialNavigationEngine {
             settings.reduceMotion = true;
             settings.autoplay = true;
             localStorage.setItem("cinejoy_settings", JSON.stringify(settings));
-
-            var userQuality = sessionStorage.getItem("__cj_user_quality");
-            var steppedUrl = sessionStorage.getItem("__cj_stepdown_url");
-            var rawPlayer = localStorage.getItem("cinejoy_player_local");
-            var playerCfg = rawPlayer ? JSON.parse(rawPlayer) : {};
-            if (userQuality === "auto") {
-                delete playerCfg.quality;
-                playerCfg.mp4Quality = "auto";
-            } else if (userQuality && /^[0-9]+$/.test(userQuality)) {
-                playerCfg.quality = parseInt(userQuality, 10);
-                playerCfg.mp4Quality = userQuality;
-            } else if (steppedUrl === location.pathname) {
-                playerCfg.quality = 1080;
-                playerCfg.mp4Quality = "1080";
-            } else {
-                playerCfg.quality = 2160;
-                playerCfg.mp4Quality = "2160";
-            }
-            localStorage.setItem("cinejoy_player_local", JSON.stringify(playerCfg));
         } catch (e) {}
     }
 
-    applyPresets();
+    applyTvPresets();
 
     if (window.__cinejoySpatialNav && window.__cinejoySpatialNav.initialized) {
         window.__cinejoySpatialNav.refresh();
@@ -120,18 +486,8 @@ object SpatialNavigationEngine {
         badDropStrikes: 0,
         stallStrikes: 0,
         noVideoTicks: 0,
-        scrubActive: false,
-        scrubTargetTime: 0,
-        scrubStartTime: 0,
-        scrubDirection: 0,
-        scrubKeyCount: 0,
-        scrubLastKeyAt: 0,
-        scrubCommitTimer: null,
-        lastSeekCommitAt: 0,
         lastMoveAt: 0,
         isBurstMove: false,
-        lastPlaybackLogAt: 0,
-        lastLoggedVideoRef: null,
         hudHidden: false,
         hudAutoHideTimer: null,
         lastHudElement: null,
@@ -208,6 +564,65 @@ object SpatialNavigationEngine {
             txt === "exit fullscreen";
     }
 
+    function isSeekControlElement(el) {
+        if (!el) {
+            return false;
+        }
+        if (el.getAttribute && el.getAttribute("data-cj-seekbar") === "1") {
+            return true;
+        }
+        if (el.tagName === "INPUT" && el.type === "range") {
+            return true;
+        }
+        if (el.getAttribute && el.getAttribute("role") === "slider") {
+            return true;
+        }
+        var aria = el.getAttribute ? (el.getAttribute("aria-label") || "").toLowerCase() : "";
+        return aria.indexOf("seek") !== -1;
+    }
+
+    function findNativeSeekControl() {
+        return document.querySelector('input[aria-label="Seek Video"], input[type="range"], [data-cj-seekbar="1"], [role="slider"]');
+    }
+
+    function findNativePlayPauseButton() {
+        return document.querySelector('button[aria-label="Pause"], button[aria-label="Play"]');
+    }
+
+    function dispatchNativeDirectionalSeek(isRight) {
+        var keyName = isRight ? "ArrowRight" : "ArrowLeft";
+        var keyCodeNum = isRight ? 39 : 37;
+        var vid = findActiveVideo();
+        var seekEl = findNativeSeekControl();
+        var playerRoot = getPlayerRoot(vid);
+        var targets = [];
+        if (seekEl) { targets.push(seekEl); }
+        if (playerRoot) { targets.push(playerRoot); }
+        targets.push(document);
+        for (var i = 0; i < targets.length; i++) {
+            try {
+                var kd = new KeyboardEvent("keydown", {
+                    key: keyName,
+                    code: keyName,
+                    keyCode: keyCodeNum,
+                    which: keyCodeNum,
+                    bubbles: true,
+                    cancelable: true
+                });
+                targets[i].dispatchEvent(kd);
+                var ku = new KeyboardEvent("keyup", {
+                    key: keyName,
+                    code: keyName,
+                    keyCode: keyCodeNum,
+                    which: keyCodeNum,
+                    bubbles: true,
+                    cancelable: true
+                });
+                targets[i].dispatchEvent(ku);
+            } catch (e) {}
+        }
+    }
+
     function getPlayerRoot(vid) {
         return document.fullscreenElement ||
             document.webkitFullscreenElement ||
@@ -225,7 +640,7 @@ object SpatialNavigationEngine {
         if (node.classList && (node.classList.contains("lp-subtitle") || node.classList.contains("animate-spin") || node.classList.contains("settings-popover"))) {
             return true;
         }
-        if (node.getAttribute && (node.getAttribute("data-cj-scrub-hud") === "1" || node.getAttribute("role") === "dialog" || node.getAttribute("aria-modal") === "true")) {
+        if (node.getAttribute && (node.getAttribute("role") === "dialog" || node.getAttribute("aria-modal") === "true")) {
             return true;
         }
         if (node.querySelector && node.querySelector('.lp-subtitle, .animate-spin, [role="dialog"], [aria-modal="true"], .settings-popover')) {
@@ -243,7 +658,7 @@ object SpatialNavigationEngine {
         if (!playerRoot) {
             return;
         }
-        var controls = playerRoot.querySelectorAll('button, [data-cj-seekbar="1"], input[type="range"]');
+        var controls = playerRoot.querySelectorAll('button, input[type="range"], [role="slider"], [data-cj-seekbar="1"]');
         for (var i = 0; i < controls.length; i++) {
             var cur = controls[i];
             var topBar = null;
@@ -265,7 +680,7 @@ object SpatialNavigationEngine {
                 continue;
             }
             var cls = (ch.className && typeof ch.className === "string") ? ch.className.toLowerCase() : "";
-            var hasControls = !!(ch.querySelector && ch.querySelector('button, [data-cj-seekbar="1"], input[type="range"]'));
+            var hasControls = !!(ch.querySelector && ch.querySelector('button, input[type="range"], [role="slider"], [data-cj-seekbar="1"]'));
             var isBarOrGradient = cls.indexOf("gradient") !== -1 || cls.indexOf("scrim") !== -1 || cls.indexOf("control") !== -1 || cls.indexOf("hud") !== -1 || cls.indexOf("bar") !== -1;
             if ((hasControls || isBarOrGradient) && ch.getAttribute("data-cj-hud-chrome") !== "1") {
                 ch.setAttribute("data-cj-hud-chrome", "1");
@@ -287,7 +702,7 @@ object SpatialNavigationEngine {
         }
         var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
         var vh = window.innerHeight || document.documentElement.clientHeight || 720;
-        if (state.scrubActive || findActiveOverlay(vw, vh)) {
+        if (findActiveOverlay(vw, vh)) {
             return false;
         }
         var vid = findActiveVideo();
@@ -306,13 +721,12 @@ object SpatialNavigationEngine {
             } catch (e) {}
         }
         document.documentElement.classList.add(HUD_HIDDEN_CLASS);
-        console.log("[CineJoyNav] hud auto-hidden after 3s");
         return true;
     }
 
     function scheduleHudAutoHide() {
         clearHudAutoHideTimer();
-        if (!isWatchRoute() || state.scrubActive) {
+        if (!isWatchRoute()) {
             return;
         }
         var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
@@ -366,7 +780,6 @@ object SpatialNavigationEngine {
 
     function onFullscreenChanged(active) {
         state.isNativeFullscreen = !!active;
-        console.log("[CineJoyNav] fullscreen state active=" + (!!active));
         showPlayerControls(true);
         setTimeout(function() {
             syncWatchPageState();
@@ -383,7 +796,7 @@ object SpatialNavigationEngine {
                         break;
                     }
                 }
-                var seekBar = document.querySelector('[data-cj-seekbar="1"]');
+                var seekBar = findNativeSeekControl();
                 if (fsBtn) {
                     applyFocus(fsBtn);
                 } else if (seekBar) {
@@ -416,7 +829,7 @@ object SpatialNavigationEngine {
             return false;
         }
         var playerRoot = getPlayerRoot(findActiveVideo());
-        var nodes = document.querySelectorAll('[data-cj-seekbar="1"], input[aria-label="Seek Video"], button[aria-label="Pause"], button[aria-label="Play"], button[aria-label*="Fullscreen"], button[aria-label*="fullscreen"]');
+        var nodes = document.querySelectorAll('input[aria-label="Seek Video"], input[type="range"], [data-cj-seekbar="1"], button[aria-label="Pause"], button[aria-label="Play"], button[aria-label*="Fullscreen"], button[aria-label*="fullscreen"]');
         for (var i = 0; i < nodes.length; i++) {
             var el = nodes[i];
             if (!el.getBoundingClientRect) {
@@ -433,116 +846,19 @@ object SpatialNavigationEngine {
         return false;
     }
 
-    function formatTimestamp(totalSec) {
-        var s = Math.max(0, Math.floor(totalSec || 0));
-        var h = Math.floor(s / 3600);
-        var m = Math.floor((s % 3600) / 60);
-        var rem = s % 60;
-        var mStr = h > 0 && m < 10 ? "0" + m : String(m);
-        var sStr = rem < 10 ? "0" + rem : String(rem);
-        return h > 0 ? (h + ":" + mStr + ":" + sStr) : (mStr + ":" + sStr);
-    }
-
-    function formatSignedDelta(deltaSec) {
-        var sign = deltaSec >= 0 ? "+" : "-";
-        var absSec = Math.abs(Math.round(deltaSec));
-        if (absSec < 60) {
-            return sign + absSec + "s";
-        }
-        var h = Math.floor(absSec / 3600);
-        var m = Math.floor((absSec % 3600) / 60);
-        var s = absSec % 60;
-        if (h > 0) {
-            return sign + h + "h " + m + "m";
-        }
-        if (s === 0) {
-            return sign + m + "m";
-        }
-        return sign + m + "m " + s + "s";
-    }
-
-    function hideScrubHud() {
-        var hud = document.querySelector('[data-cj-scrub-hud="1"]');
-        if (hud && hud.parentNode) {
-            hud.parentNode.removeChild(hud);
-        }
-        var fill = document.querySelector('[data-cj-scrub-fill="1"]');
-        if (fill && fill.parentNode) {
-            fill.parentNode.removeChild(fill);
-        }
-    }
-
-    function cancelScrub() {
-        if (state.scrubCommitTimer) {
-            clearTimeout(state.scrubCommitTimer);
-            state.scrubCommitTimer = null;
-        }
-        state.scrubActive = false;
-        state.scrubKeyCount = 0;
-        state.scrubDirection = 0;
-        hideScrubHud();
-        if (isWatchRoute()) {
-            scheduleHudAutoHide();
-        }
-    }
-
-    function renderScrubHud(targetSec, durationSec, startSec) {
-        var pct = durationSec > 0 ? Math.max(0, Math.min(100, (targetSec / durationSec) * 100)) : 0;
-        var hudHost = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root") || document.body;
-        var hud = document.querySelector('[data-cj-scrub-hud="1"]');
-        if (!hud) {
-            hud = document.createElement("div");
-            hud.setAttribute("data-cj-scrub-hud", "1");
-        }
-        if (hudHost && hud.parentNode !== hudHost) {
-            hudHost.appendChild(hud);
-        }
-        var deltaStr = formatSignedDelta(targetSec - startSec);
-        var totalStr = durationSec > 0 ? (" / " + formatTimestamp(durationSec)) : "";
-        hud.innerHTML =
-            "<div style=\"display:flex;align-items:baseline;justify-content:center;gap:12px;\">" +
-            "<span style=\"font-size:22px;font-weight:700;color:rgb(255,255,255);\">" + formatTimestamp(targetSec) + totalStr + "</span>" +
-            "<span style=\"font-size:15px;font-weight:700;color:rgb(255,255,0);background:rgba(255,255,0,0.14);padding:2px 8px;border-radius:6px;\">" + deltaStr + "</span>" +
-            "</div>" +
-            "<div style=\"font-size:11px;color:rgb(200,208,204);margin-top:4px;text-align:center;\">Left/Right to scrub anywhere &bull; OK to jump immediately</div>";
-
-        var bar = syncSeekBarElement();
-        if (bar) {
-            if (window.getComputedStyle(bar).position === "static") {
-                bar.style.position = "relative";
-            }
-            var fill = bar.querySelector('[data-cj-scrub-fill="1"]');
-            if (!fill) {
-                fill = document.createElement("div");
-                fill.setAttribute("data-cj-scrub-fill", "1");
-                bar.appendChild(fill);
-            }
-            fill.style.width = pct.toFixed(2) + "%";
-        }
-    }
-
     function releaseOverlaySafely(destroyVideo) {
         if (destroyVideo) {
-            cancelScrub();
-            var videos = document.querySelectorAll("video");
-            for (var i = 0; i < videos.length; i++) {
-                var v = videos[i];
-                try { v.pause(); } catch (e) {}
-                try { v.removeAttribute("src"); } catch (e2) {}
-                try { v.srcObject = null; } catch (e3) {}
-                try { v.load(); } catch (e4) {}
-                try {
-                    if (v.parentNode) {
-                        v.parentNode.removeChild(v);
-                    }
-                } catch (e5) {}
-            }
+            try {
+                if (window.__cinejoyReleaseMedia) {
+                    window.__cinejoyReleaseMedia(false);
+                }
+            } catch (eRel) {}
         }
         try {
             if (window.__cinejoyNative && window.__cinejoyNative.releaseVideoOverlay) {
                 window.__cinejoyNative.releaseVideoOverlay();
             }
-        } catch (e6) {}
+        } catch (eNat) {}
     }
 
     function pruneSubtitleTracks(video) {
@@ -574,23 +890,6 @@ object SpatialNavigationEngine {
                 node.parentNode.removeChild(node);
             }
         }
-        console.log("[CineJoyNav] pruned subtitle tracks kept=" + kept + " removed=" + toRemove.length);
-    }
-
-    function syncSeekBarElement() {
-        var seekInput = document.querySelector('input[aria-label="Seek Video"], input[type="range"]');
-        if (!seekInput || !seekInput.parentElement) {
-            return null;
-        }
-        var bar = seekInput.parentElement;
-        if (bar.getAttribute("data-cj-seekbar") !== "1") {
-            bar.setAttribute("role", "slider");
-            bar.setAttribute("tabindex", "0");
-            bar.setAttribute("aria-label", "Timeline Seek Bar");
-            bar.setAttribute("data-cj-seekbar", "1");
-            state.cacheTime = 0;
-        }
-        return bar;
     }
 
     function syncWatchPageState() {
@@ -598,7 +897,11 @@ object SpatialNavigationEngine {
         reportSurfaceTransparency(onWatch);
         if (onWatch) {
             document.documentElement.classList.add(WATCH_CLASS);
-            syncSeekBarElement();
+            var seekBar = findNativeSeekControl();
+            if (seekBar && seekBar.getAttribute("data-cj-seekbar") !== "1") {
+                seekBar.setAttribute("data-cj-seekbar", "1");
+                state.cacheTime = 0;
+            }
             var videos = document.querySelectorAll("video");
             var vid = videos.length > 0 ? videos[0] : findActiveVideo();
             if (vid) {
@@ -616,11 +919,10 @@ object SpatialNavigationEngine {
                 }
             }
             markPlayerControlContainers();
-            if (vid && !vid.paused && !state.hudHidden && !state.hudAutoHideTimer && !state.scrubActive) {
+            if (vid && !vid.paused && !state.hudHidden && !state.hudAutoHideTimer) {
                 scheduleHudAutoHide();
             }
         } else {
-            cancelScrub();
             resetHudAutoHide();
             document.documentElement.classList.remove(WATCH_CLASS);
             var cleaned = document.querySelectorAll('[data-cj-trans="1"]');
@@ -633,7 +935,6 @@ object SpatialNavigationEngine {
             var strayVideos = document.querySelectorAll("video");
             if (strayVideos.length > 0) {
                 releaseOverlaySafely(true);
-                console.log("[CineJoyNav] stripped non-watch video count=" + strayVideos.length);
             }
         }
     }
@@ -684,36 +985,9 @@ object SpatialNavigationEngine {
             " transform: none !important;" +
             " z-index: 9999 !important;" +
             " }" +
-            "[data-cj-seekbar=\"1\"]." + FOCUS_CLASS + " {" +
+            "[data-cj-seekbar=\"1\"]." + FOCUS_CLASS + ", input[type=\"range\"]." + FOCUS_CLASS + " {" +
             " background-color: rgba(255, 255, 0, 0.22) !important;" +
             " border-radius: 8px !important;" +
-            " }" +
-            "[data-cj-seekbar=\"1\"]." + FOCUS_CLASS + " > div {" +
-            " height: 8px !important;" +
-            " }" +
-            "[data-cj-scrub-hud=\"1\"] {" +
-            " position: fixed;" +
-            " left: 50%;" +
-            " bottom: 112px;" +
-            " transform: translateX(-50%);" +
-            " background-color: rgba(12, 14, 16, 0.94);" +
-            " border: 2px solid rgb(255, 255, 0);" +
-            " border-radius: 10px;" +
-            " padding: 8px 18px;" +
-            " min-width: 240px;" +
-            " z-index: 999999;" +
-            " pointer-events: none;" +
-            " font-family: sans-serif;" +
-            " }" +
-            "[data-cj-scrub-fill=\"1\"] {" +
-            " position: absolute;" +
-            " left: 0;" +
-            " top: 0;" +
-            " bottom: 0;" +
-            " background-color: rgb(255, 255, 0);" +
-            " border-radius: 999px;" +
-            " pointer-events: none;" +
-            " z-index: 20;" +
             " }" +
             "[data-cj-hud-chrome=\"1\"] {" +
             " transition: opacity 180ms ease !important;" +
@@ -850,15 +1124,13 @@ object SpatialNavigationEngine {
         if (el.disabled || el.getAttribute("aria-disabled") === "true" || el.getAttribute("aria-hidden") === "true") {
             return false;
         }
-        if (el.tagName === "INPUT" && el.type === "range") {
-            return false;
-        }
         var tabIdx = el.getAttribute("tabindex");
         if (tabIdx === "-1" && !matchesSelector(el, "a[href], button, input, select, textarea")) {
             return false;
         }
         var rect = el.getBoundingClientRect();
-        if (rect.width < 12 || rect.height < 12) {
+        var minH = isSeekControlElement(el) ? 6 : 12;
+        if (rect.width < 12 || rect.height < minH) {
             return false;
         }
         if (rect.width > vw * 0.92 && rect.height > vh * 0.85) {
@@ -891,25 +1163,13 @@ object SpatialNavigationEngine {
         if (!style || style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") {
             return false;
         }
-        if (parseFloat(style.opacity || "1") <= 0.05) {
+        if (parseFloat(style.opacity || "1") <= 0.05 && !isSeekControlElement(el)) {
             return false;
         }
         if (el.offsetParent === null && style.position !== "fixed" && style.position !== "sticky" && el.tagName !== "BODY") {
             return false;
         }
         return true;
-    }
-
-    function getElementLabel(el) {
-        if (!el) {
-            return "";
-        }
-        var label = el.getAttribute("aria-label") || el.getAttribute("title") || el.innerText || el.textContent || "";
-        label = label.replace(/\s+/g, " ").trim();
-        if (label.length > 48) {
-            label = label.substring(0, 48);
-        }
-        return label || el.tagName;
     }
 
     function deduplicateLinks(rawList, inPreview) {
@@ -1043,7 +1303,7 @@ object SpatialNavigationEngine {
     }
 """
 
-    private const val FOCUS_POLYFILL_TAIL = """
+    private const val FIRESTICK_NAV_TAIL = """
     function applyFocus(el) {
         if (!el || !document.body.contains(el)) {
             return;
@@ -1095,7 +1355,6 @@ object SpatialNavigationEngine {
                 }
             }
         }
-        console.log("[CineJoyNav] focus: " + el.tagName + " | " + getElementLabel(el));
     }
 
     function findEntryForElement(el) {
@@ -1129,7 +1388,7 @@ object SpatialNavigationEngine {
             return state.spatialMap[0];
         }
         if (isWatchRoute()) {
-            var seekBar = document.querySelector('[data-cj-seekbar="1"]');
+            var seekBar = findNativeSeekControl();
             if (seekBar) {
                 for (var s = 0; s < state.spatialMap.length; s++) {
                     if (state.spatialMap[s].el === seekBar) {
@@ -1188,120 +1447,6 @@ object SpatialNavigationEngine {
         return false;
     }
 
-    function commitScrub() {
-        if (state.scrubCommitTimer) {
-            clearTimeout(state.scrubCommitTimer);
-            state.scrubCommitTimer = null;
-        }
-        if (!state.scrubActive) {
-            return false;
-        }
-        var targetTime = state.scrubTargetTime;
-        var startTime = state.scrubStartTime;
-        state.scrubActive = false;
-        state.scrubKeyCount = 0;
-        state.scrubDirection = 0;
-        hideScrubHud();
-
-        var vid = findActiveVideo();
-        if (!vid) {
-            return false;
-        }
-        try {
-            if (vid.duration && !isNaN(vid.duration)) {
-                targetTime = Math.max(0, Math.min(vid.duration, targetTime));
-            } else {
-                targetTime = Math.max(0, targetTime);
-            }
-            state.lastSeekCommitAt = Date.now();
-            state.stallStrikes = 0;
-            state.badDropStrikes = 0;
-            state.lastPlayTime = targetTime;
-            vid.currentTime = targetTime;
-            var seekInput = document.querySelector('input[aria-label="Seek Video"], input[type="range"]');
-            if (seekInput) {
-                seekInput.value = String(targetTime);
-                seekInput.dispatchEvent(new Event("input", { bubbles: true }));
-                seekInput.dispatchEvent(new Event("change", { bubbles: true }));
-            }
-            console.log("[CineJoyNav] scrub commit to=" + Math.round(targetTime) + " delta=" + Math.round(targetTime - startTime));
-            scheduleHudAutoHide();
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    function computeAdaptiveStep(durationSec) {
-        var step = 10;
-        var c = state.scrubKeyCount;
-        if (c >= 21) {
-            step = 600;
-        } else if (c >= 15) {
-            step = 300;
-        } else if (c >= 10) {
-            step = 180;
-        } else if (c >= 6) {
-            step = 60;
-        } else if (c >= 3) {
-            step = 30;
-        }
-        if (durationSec > 0 && durationSec < 900) {
-            step = Math.min(step, Math.max(10, Math.round(durationSec / 18)));
-        }
-        return step;
-    }
-
-    function scrubTimeline(baseDeltaSeconds) {
-        var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
-        var vh = window.innerHeight || document.documentElement.clientHeight || 720;
-        if (findActiveOverlay(vw, vh)) {
-            return false;
-        }
-        var now = Date.now();
-        var dir = baseDeltaSeconds >= 0 ? 1 : -1;
-        if (state.scrubDirection === dir && (now - state.scrubLastKeyAt) < 750) {
-            state.scrubKeyCount++;
-        } else {
-            state.scrubDirection = dir;
-            state.scrubKeyCount = 1;
-        }
-        state.scrubLastKeyAt = now;
-
-        wakePlayerHud();
-        var vid = findActiveVideo();
-        if (!vid) {
-            return false;
-        }
-
-        var durationSec = (vid.duration && !isNaN(vid.duration)) ? vid.duration : 0;
-        var step = computeAdaptiveStep(durationSec);
-        if (Math.abs(baseDeltaSeconds) > step) {
-            step = Math.abs(baseDeltaSeconds);
-        }
-        var delta = dir * step;
-
-        if (!state.scrubActive) {
-            state.scrubActive = true;
-            state.scrubStartTime = vid.currentTime || 0;
-            state.scrubTargetTime = state.scrubStartTime;
-        }
-
-        var nextTarget = Math.max(0, state.scrubTargetTime + delta);
-        if (durationSec > 0) {
-            nextTarget = Math.min(durationSec, nextTarget);
-        }
-        state.scrubTargetTime = nextTarget;
-        renderScrubHud(nextTarget, durationSec, state.scrubStartTime);
-
-        if (state.scrubCommitTimer) {
-            clearTimeout(state.scrubCommitTimer);
-        }
-        state.scrubCommitTimer = setTimeout(commitScrub, 650);
-        console.log("[CineJoyNav] scrub preview: step=" + delta + " streak=" + state.scrubKeyCount + " target=" + Math.round(nextTarget));
-        return true;
-    }
-
     function move(direction) {
         var nowMove = Date.now();
         state.isBurstMove = (nowMove - state.lastMoveAt) < 180;
@@ -1316,7 +1461,7 @@ object SpatialNavigationEngine {
                 showPlayerControls(true);
                 if (!hudWasVisible) {
                     if (direction === "left" || direction === "right") {
-                        scrubTimeline(direction === "right" ? 10 : -10);
+                        dispatchNativeDirectionalSeek(direction === "right");
                     }
                     if (state.hudWakeTimer) {
                         clearTimeout(state.hudWakeTimer);
@@ -1326,14 +1471,14 @@ object SpatialNavigationEngine {
                         scanElements(false);
                         var target = (state.lastHudElement && document.body.contains(state.lastHudElement) && isVisibleElement(state.lastHudElement, vw, vh, true))
                             ? state.lastHudElement
-                            : document.querySelector('[data-cj-seekbar="1"], button[aria-label="Pause"], button[aria-label="Play"]');
+                            : (findNativeSeekControl() || findNativePlayPauseButton());
                         if (target) {
                             applyFocus(target);
                         } else if (!ensureFocus()) {
                             setTimeout(function() {
                                 syncWatchPageState();
                                 scanElements(false);
-                                var retryTarget = document.querySelector('[data-cj-seekbar="1"], button[aria-label="Pause"], button[aria-label="Play"]');
+                                var retryTarget = findNativeSeekControl() || findNativePlayPauseButton();
                                 if (retryTarget) {
                                     applyFocus(retryTarget);
                                 } else {
@@ -1344,21 +1489,10 @@ object SpatialNavigationEngine {
                     }, 50);
                     return;
                 }
-                if (!document.querySelector('[data-cj-seekbar="1"]') && document.querySelector('input[aria-label="Seek Video"], input[type="range"]')) {
-                    syncWatchPageState();
-                    state.cacheTime = 0;
-                }
-                if (state.currentElement && state.currentElement.getAttribute("data-cj-seekbar") === "1") {
-                    if (direction === "left") {
-                        scrubTimeline(-10);
+                if (state.currentElement && isSeekControlElement(state.currentElement)) {
+                    if (direction === "left" || direction === "right") {
+                        dispatchNativeDirectionalSeek(direction === "right");
                         return;
-                    }
-                    if (direction === "right") {
-                        scrubTimeline(10);
-                        return;
-                    }
-                    if (state.scrubActive && (direction === "up" || direction === "down")) {
-                        commitScrub();
                     }
                 }
             }
@@ -1492,7 +1626,6 @@ object SpatialNavigationEngine {
                 }
                 state.scrollTimer = setTimeout(function() {
                     scanElements(false);
-                    console.log("[CineJoyNav] scrolled " + direction + " mapped=" + state.spatialMap.length);
                 }, 90);
             }
         }
@@ -1532,8 +1665,16 @@ object SpatialNavigationEngine {
                 el.focus();
             } catch (e3) {}
         }
-        console.log("[CineJoyNav] tap: " + el.tagName + " | " + getElementLabel(el));
         return (cx / vw).toFixed(5) + "," + (cy / vh).toFixed(5);
+    }
+
+    function clickNativePlayPause() {
+        var btn = findNativePlayPauseButton();
+        if (btn && typeof btn.click === "function") {
+            btn.click();
+            return true;
+        }
+        return toggleVideo();
     }
 
     function activateOrTap() {
@@ -1543,8 +1684,8 @@ object SpatialNavigationEngine {
             var hudWasVisible = isHudVisible();
             var watchOverlay = findActiveOverlay(vw, vh);
             if (!hudWasVisible && !watchOverlay) {
-                showPlayerControls(false);
-                toggleVideo();
+                showPlayerControls(true);
+                clickNativePlayPause();
                 if (state.hudWakeTimer) {
                     clearTimeout(state.hudWakeTimer);
                 }
@@ -1553,7 +1694,7 @@ object SpatialNavigationEngine {
                     scanElements(false);
                     var target = (state.lastHudElement && document.body.contains(state.lastHudElement) && isVisibleElement(state.lastHudElement, vw, vh, true))
                         ? state.lastHudElement
-                        : document.querySelector('[data-cj-seekbar="1"], button[aria-label="Pause"], button[aria-label="Play"]');
+                        : (findNativeSeekControl() || findNativePlayPauseButton());
                     if (target) {
                         applyFocus(target);
                     } else {
@@ -1577,13 +1718,9 @@ object SpatialNavigationEngine {
             return "none";
         }
 
-        if (el.getAttribute("data-cj-seekbar") === "1") {
+        if (isSeekControlElement(el)) {
             showPlayerControls(true);
-            if (state.scrubActive) {
-                commitScrub();
-            } else {
-                toggleVideo();
-            }
+            clickNativePlayPause();
             return "clicked";
         }
 
@@ -1603,11 +1740,9 @@ object SpatialNavigationEngine {
                     }
                 } catch (eFs2) {}
                 showPlayerControls(true);
-                console.log("[CineJoyNav] exited fullscreen via button");
                 return "clicked";
             }
             showPlayerControls(true);
-            console.log("[CineJoyNav] requesting fullscreen via button");
             return "tap-fs:" + prepareTapCoords(el);
         }
 
@@ -1619,7 +1754,6 @@ object SpatialNavigationEngine {
         var rect = el.getBoundingClientRect();
         var cx = rect.left + rect.width * 0.5;
         var cy = rect.top + rect.height * 0.5;
-        console.log("[CineJoyNav] click: " + el.tagName + " | " + getElementLabel(el));
 
         dispatchPointerEvent(el, "pointerdown", cx, cy);
         dispatchPointerEvent(el, "mousedown", cx, cy);
@@ -1647,11 +1781,6 @@ object SpatialNavigationEngine {
     }
 
     function dismissActiveOverlay() {
-        if (state.scrubActive) {
-            cancelScrub();
-            console.log("[CineJoyNav] dismissed active scrub preview");
-            return "dismissed";
-        }
         var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
         var vh = window.innerHeight || document.documentElement.clientHeight || 720;
 
@@ -1673,7 +1802,6 @@ object SpatialNavigationEngine {
                     scheduleHudAutoHide();
                 }
             }, 90);
-            console.log("[CineJoyNav] dismissed preview overlay");
             return "dismissed";
         }
 
@@ -1717,7 +1845,6 @@ object SpatialNavigationEngine {
                     scheduleHudAutoHide();
                 }
             }, 90);
-            console.log("[CineJoyNav] dismissed modal overlay");
             return "dismissed";
         }
 
@@ -1757,7 +1884,6 @@ object SpatialNavigationEngine {
                 vid.pause();
                 showPlayerControls(false);
             }
-            console.log("[CineJoyNav] video toggled paused=" + vid.paused);
             return true;
         } catch (e) {
             return false;
@@ -1765,7 +1891,12 @@ object SpatialNavigationEngine {
     }
 
     function seekVideo(deltaSeconds) {
-        return scrubTimeline(deltaSeconds);
+        if (!isWatchRoute()) {
+            return false;
+        }
+        showPlayerControls(true);
+        dispatchNativeDirectionalSeek(deltaSeconds >= 0);
+        return true;
     }
 
     function findButtonByTextOrAria(targetText) {
@@ -1807,7 +1938,7 @@ object SpatialNavigationEngine {
             } else if (txt === "1080p" || txt.indexOf("1080p") === 0 || txt === "720p" || txt.indexOf("720p") === 0 || txt === "480p" || txt === "360p") {
                 var numQ = txt.replace(/[^0-9]/g, "");
                 try {
-                    sessionStorage.setItem("__cj_user_quality", numQ || "1080");
+                    sessionStorage.setItem("__cj_user_quality", numQ || "720");
                     sessionStorage.setItem("__cj_stepdown_url", location.pathname);
                 } catch (e2) {}
                 releaseOverlaySafely(false);
@@ -1839,7 +1970,6 @@ object SpatialNavigationEngine {
         var serversBtn = findButtonByTextOrAria("Servers");
         if (serversBtn) {
             var nextServer = SERVER_ORDER[Math.min(tries + 1, SERVER_ORDER.length - 1)];
-            console.log("[CineJoyNav] fallback switching server=" + nextServer + " attempt=" + (tries + 1));
             releaseOverlaySafely(true);
             serversBtn.click();
             setTimeout(function() {
@@ -1853,7 +1983,6 @@ object SpatialNavigationEngine {
 
         var tryAgainBtn = findButtonByTextOrAria("Try Again");
         if (tryAgainBtn && tries === 0) {
-            console.log("[CineJoyNav] fallback clicking Try Again");
             releaseOverlaySafely(true);
             tryAgainBtn.click();
             return true;
@@ -1861,7 +1990,7 @@ object SpatialNavigationEngine {
         return false;
     }
 
-    function triggerOverlayRecovery(reason) {
+    function triggerOverlayRecovery() {
         var lastRecover = 0;
         try {
             lastRecover = parseInt(sessionStorage.getItem("__cj_overlay_recover") || "0", 10) || 0;
@@ -1870,7 +1999,6 @@ object SpatialNavigationEngine {
             return;
         }
         try { sessionStorage.setItem("__cj_overlay_recover", String(Date.now())); } catch (e2) {}
-        console.log("[CineJoyNav] fallback overlay recovery reason=" + reason);
         releaseOverlaySafely(true);
         setTimeout(function() {
             location.reload();
@@ -1896,7 +2024,7 @@ object SpatialNavigationEngine {
         var vid = findActiveVideo();
         if (!vid || vid.error) {
             state.noVideoTicks++;
-            if ((vid && vid.error) || state.noVideoTicks >= 6) {
+            if ((vid && vid.error) || state.noVideoTicks >= 10) {
                 state.noVideoTicks = 0;
                 attemptServerFallback();
             }
@@ -1905,7 +2033,7 @@ object SpatialNavigationEngine {
 
         if (vid.readyState === 0 && !vid.paused) {
             state.noVideoTicks++;
-            if (state.noVideoTicks >= 6) {
+            if (state.noVideoTicks >= 10) {
                 state.noVideoTicks = 0;
                 attemptServerFallback();
             }
@@ -1913,26 +2041,8 @@ object SpatialNavigationEngine {
         }
 
         state.noVideoTicks = 0;
-        if (state.scrubActive || (Date.now() - state.lastSeekCommitAt) < 7000) {
-            state.stallStrikes = 0;
-            state.badDropStrikes = 0;
-            state.lastVideoRef = vid;
-            state.lastDecoded = vid.webkitDecodedFrameCount || 0;
-            state.lastDropped = vid.webkitDroppedFrameCount || 0;
-            state.lastPlayTime = vid.currentTime || 0;
-            return;
-        }
-
         var decoded = vid.webkitDecodedFrameCount || 0;
         var dropped = vid.webkitDroppedFrameCount || 0;
-        var nowMs = Date.now();
-        if ((vid.videoWidth || 0) > 0 && (state.lastLoggedVideoRef !== vid || nowMs - state.lastPlaybackLogAt >= 10000)) {
-            state.lastLoggedVideoRef = vid;
-            state.lastPlaybackLogAt = nowMs;
-            console.log("[CineJoyNav] playback res=" + (vid.videoWidth || 0) + "x" + (vid.videoHeight || 0) +
-                " t=" + Math.round(vid.currentTime || 0) + " dur=" + Math.round(vid.duration || 0) +
-                " paused=" + (!!vid.paused) + " decoded=" + decoded + " dropped=" + dropped);
-        }
 
         if (!vid.paused && vid.readyState >= 2) {
             if (state.lastVideoRef === vid) {
@@ -1942,7 +2052,7 @@ object SpatialNavigationEngine {
                     state.badDropStrikes++;
                     if (state.badDropStrikes >= 2) {
                         state.badDropStrikes = 0;
-                        triggerOverlayRecovery("dropped_frames_" + dDrop + "_of_" + dDec);
+                        triggerOverlayRecovery();
                         return;
                     }
                 } else {
@@ -1951,18 +2061,18 @@ object SpatialNavigationEngine {
 
                 if (vid.videoWidth >= 3000 && vid.readyState < 3 && Math.abs((vid.currentTime || 0) - state.lastPlayTime) < 0.05) {
                     state.stallStrikes++;
-                    if (state.stallStrikes >= 4) {
+                    if (state.stallStrikes >= 6) {
                         state.stallStrikes = 0;
                         try {
                             if (sessionStorage.getItem("__cj_stepdown_url") !== location.pathname) {
                                 sessionStorage.setItem("__cj_stepdown_url", location.pathname);
-                                sessionStorage.setItem("__cj_user_quality", "1080");
+                                sessionStorage.setItem("__cj_user_quality", "720");
                                 var rawPlayer = localStorage.getItem("cinejoy_player_local");
                                 var playerCfg = rawPlayer ? JSON.parse(rawPlayer) : {};
-                                playerCfg.quality = 1080;
-                                playerCfg.mp4Quality = "1080";
+                                playerCfg.quality = 720;
+                                playerCfg.mp4Quality = "720";
                                 localStorage.setItem("cinejoy_player_local", JSON.stringify(playerCfg));
-                                triggerOverlayRecovery("4k_bandwidth_stepdown_1080");
+                                triggerOverlayRecovery();
                                 return;
                             }
                         } catch (e) {}
@@ -1985,33 +2095,11 @@ object SpatialNavigationEngine {
         state.watchdogTimer = setInterval(runPlaybackWatchdog, 2500);
     }
 
-    function hasStructuralMutations(mutations) {
-        for (var i = 0; i < mutations.length; i++) {
-            var m = mutations[i];
-            for (var a = 0; a < m.addedNodes.length; a++) {
-                var an = m.addedNodes[a];
-                if (an.nodeType === 1 && an.getAttribute && an.getAttribute("data-cj-scrub-hud") !== "1" && an.getAttribute("data-cj-scrub-fill") !== "1") {
-                    return true;
-                }
-            }
-            for (var r = 0; r < m.removedNodes.length; r++) {
-                var rn = m.removedNodes[r];
-                if (rn.nodeType === 1 && rn.getAttribute && rn.getAttribute("data-cj-scrub-hud") !== "1" && rn.getAttribute("data-cj-scrub-fill") !== "1") {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     function installObserver() {
         if (state.observer || !document.body || typeof MutationObserver === "undefined") {
             return;
         }
-        state.observer = new MutationObserver(function(mutations) {
-            if (!hasStructuralMutations(mutations)) {
-                return;
-            }
+        state.observer = new MutationObserver(function() {
             if (state.refreshTimer) {
                 clearTimeout(state.refreshTimer);
             }
@@ -2044,7 +2132,7 @@ object SpatialNavigationEngine {
     }
 
     function refresh() {
-        applyPresets();
+        applyTvPresets();
         injectStyles();
         syncWatchPageState();
         ensureFocus();
@@ -2052,8 +2140,7 @@ object SpatialNavigationEngine {
         installClickInterceptor();
         installWatchdog();
         var renderedNodes = document.querySelectorAll('a[href*="/movie/"], a[href*="/tv/"], a[href*="/watch/"], button');
-        var heroOrCardReady = renderedNodes.length >= 4 && state.spatialMap.length >= 6;
-        if (heroOrCardReady) {
+        if (renderedNodes.length >= 4 && state.spatialMap.length >= 6) {
             try {
                 if (window.__cinejoyNative && window.__cinejoyNative.onWebContentRendered) {
                     window.__cinejoyNative.onWebContentRendered();
@@ -2071,7 +2158,6 @@ object SpatialNavigationEngine {
         dismissActiveOverlay: dismissActiveOverlay,
         toggleVideo: toggleVideo,
         seekVideo: seekVideo,
-        commitScrub: commitScrub,
         onFullscreenChanged: onFullscreenChanged,
         getFullscreenTapCoords: function() {
             var btns = document.querySelectorAll("button");
@@ -2097,12 +2183,210 @@ object SpatialNavigationEngine {
     };
 
     refresh();
-    console.log("[CineJoyNav] initialized elements=" + state.spatialMap.length);
 })();
 """
 
-    private val focusPolyfillScript: String by lazy {
-        FOCUS_POLYFILL_HEAD + "\n" + FOCUS_POLYFILL_TAIL
+    private const val MOBILE_PLAYBACK_SCRIPT = """
+(function() {
+    if (window.__cinejoyMobileHud && window.__cinejoyMobileHud.initialized) {
+        window.__cinejoyMobileHud.refresh();
+        return;
+    }
+
+    var WATCH_CLASS = "cinejoy-watch-active";
+    var HUD_HIDDEN_CLASS = "cinejoy-hud-hidden";
+    var STYLE_ATTR = "data-cinejoy-mobile-hud";
+    var HUD_AUTO_HIDE_MS = 3000;
+    var hudTimer = null;
+    var boundVid = null;
+    var lastReportedWatch = null;
+
+    function isWatchRoute() {
+        return location.pathname.indexOf("/watch/") !== -1;
+    }
+
+    function reportTransparency(onWatch) {
+        if (lastReportedWatch === onWatch) {
+            return;
+        }
+        lastReportedWatch = onWatch;
+        try {
+            if (window.__cinejoyNative && window.__cinejoyNative.setWatchSurfaceTransparent) {
+                window.__cinejoyNative.setWatchSurfaceTransparent(!!onWatch);
+            }
+        } catch (e) {}
+    }
+
+    function injectMobileStyles() {
+        if (document.querySelector("style[" + STYLE_ATTR + "=\"true\"]")) {
+            return;
+        }
+        var style = document.createElement("style");
+        style.setAttribute(STYLE_ATTR, "true");
+        style.type = "text/css";
+        style.textContent =
+            "html." + WATCH_CLASS + ", html." + WATCH_CLASS + " > body, html." + WATCH_CLASS + " .app-shell, html." + WATCH_CLASS + " .player-root, html." + WATCH_CLASS + " video {" +
+            " background: transparent !important;" +
+            " background-color: transparent !important;" +
+            " }" +
+            "[data-cj-hud-chrome=\"1\"] {" +
+            " transition: opacity 180ms ease !important;" +
+            " }" +
+            "html." + WATCH_CLASS + "." + HUD_HIDDEN_CLASS + " [data-cj-hud-chrome=\"1\"] {" +
+            " opacity: 0 !important;" +
+            " visibility: hidden !important;" +
+            " pointer-events: none !important;" +
+            " }";
+        var target = document.head || document.documentElement;
+        if (target) {
+            target.appendChild(style);
+        }
+    }
+
+    function isProtectedNode(node, vid) {
+        if (!node || node.nodeType !== 1) {
+            return true;
+        }
+        if (node === vid || (vid && node.contains(vid))) {
+            return true;
+        }
+        if (node.classList && (node.classList.contains("lp-subtitle") || node.classList.contains("animate-spin") || node.classList.contains("settings-popover"))) {
+            return true;
+        }
+        if (node.getAttribute && (node.getAttribute("role") === "dialog" || node.getAttribute("aria-modal") === "true")) {
+            return true;
+        }
+        if (node.querySelector && node.querySelector('.lp-subtitle, .animate-spin, [role="dialog"], [aria-modal="true"], .settings-popover')) {
+            return true;
+        }
+        return false;
+    }
+
+    function hasActiveDialog() {
+        var nodes = document.querySelectorAll('[role="dialog"], [aria-modal="true"], [role="menu"], .menu-panel');
+        for (var i = 0; i < nodes.length; i++) {
+            var style = window.getComputedStyle(nodes[i]);
+            if (style && style.display !== "none" && style.visibility !== "hidden") {
+                var r = nodes[i].getBoundingClientRect();
+                if (r.width >= 40 && r.height >= 40) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    function markHudChrome() {
+        var vid = document.querySelector("video");
+        var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root") || (vid ? vid.parentElement : null);
+        if (!root) {
+            return;
+        }
+        var controls = root.querySelectorAll('button, input[type="range"], [role="slider"]');
+        for (var i = 0; i < controls.length; i++) {
+            var cur = controls[i];
+            var topBar = null;
+            while (cur && cur !== root && cur !== document.body && cur !== document.documentElement) {
+                if (isProtectedNode(cur, vid)) {
+                    break;
+                }
+                topBar = cur;
+                cur = cur.parentElement;
+            }
+            if (topBar && topBar.getAttribute("data-cj-hud-chrome") !== "1") {
+                topBar.setAttribute("data-cj-hud-chrome", "1");
+            }
+        }
+    }
+
+    function clearTimer() {
+        if (hudTimer) {
+            clearTimeout(hudTimer);
+            hudTimer = null;
+        }
+    }
+
+    function hideHud() {
+        clearTimer();
+        if (!isWatchRoute() || hasActiveDialog()) {
+            return;
+        }
+        var vid = document.querySelector("video");
+        if (!vid || vid.paused) {
+            return;
+        }
+        markHudChrome();
+        document.documentElement.classList.add(HUD_HIDDEN_CLASS);
+    }
+
+    function scheduleHide() {
+        clearTimer();
+        if (!isWatchRoute() || hasActiveDialog()) {
+            return;
+        }
+        var vid = document.querySelector("video");
+        if (vid && vid.paused) {
+            return;
+        }
+        hudTimer = setTimeout(hideHud, HUD_AUTO_HIDE_MS);
+    }
+
+    function wakeHud() {
+        document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
+        scheduleHide();
+    }
+
+    function refresh() {
+        injectMobileStyles();
+        var onWatch = isWatchRoute();
+        reportTransparency(onWatch);
+        if (onWatch) {
+            document.documentElement.classList.add(WATCH_CLASS);
+            markHudChrome();
+            var vid = document.querySelector("video");
+            if (vid && boundVid !== vid) {
+                boundVid = vid;
+                vid.addEventListener("play", scheduleHide);
+                vid.addEventListener("playing", scheduleHide);
+                vid.addEventListener("pause", function() {
+                    clearTimer();
+                    document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
+                });
+            }
+            if (vid && !vid.paused && !hudTimer && !document.documentElement.classList.contains(HUD_HIDDEN_CLASS)) {
+                scheduleHide();
+            }
+        } else {
+            clearTimer();
+            document.documentElement.classList.remove(WATCH_CLASS);
+            document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
+        }
+        var readyNodes = document.querySelectorAll('a[href*="/movie/"], a[href*="/tv/"], a[href*="/watch/"], button');
+        if (readyNodes.length >= 4) {
+            try {
+                if (window.__cinejoyNative && window.__cinejoyNative.onWebContentRendered) {
+                    window.__cinejoyNative.onWebContentRendered();
+                }
+            } catch (e) {}
+        }
+    }
+
+    document.addEventListener("touchstart", wakeHud, { passive: true, capture: true });
+    document.addEventListener("pointerdown", wakeHud, { passive: true, capture: true });
+    document.addEventListener("click", wakeHud, true);
+
+    window.__cinejoyMobileHud = {
+        initialized: true,
+        refresh: refresh
+    };
+
+    refresh();
+    setInterval(refresh, 2000);
+})();
+"""
+
+    private val firestickScript: String by lazy {
+        FIRESTICK_NAV_HEAD + "\n" + FIRESTICK_NAV_TAIL
     }
 
     private fun safeEvaluateJs(
@@ -2129,37 +2413,75 @@ object SpatialNavigationEngine {
         }
     }
 
-    fun applyFast4kPresets(webView: WebView) {
+    fun applyNetworkAndPresets(webView: WebView) {
         runOnUiImmediate(webView) {
-            safeEvaluateJs(webView, PRESET_BOOTSTRAP_SCRIPT)
+            safeEvaluateJs(webView, NETWORK_RESILIENCE_AND_PRESET_SCRIPT)
         }
     }
 
     fun injectIntoWebView(webView: WebView) {
         runOnUiImmediate(webView) {
-            safeEvaluateJs(webView, focusPolyfillScript)
+            safeEvaluateJs(webView, NETWORK_RESILIENCE_AND_PRESET_SCRIPT)
+            val platformScript = if (BuildConfig.IS_TV_PLATFORM) firestickScript else MOBILE_PLAYBACK_SCRIPT
+            safeEvaluateJs(webView, platformScript)
         }
     }
 
     fun refreshMap(webView: WebView) {
         runOnUiImmediate(webView) {
-            safeEvaluateJs(
-                webView,
-                "if (window.__cinejoySpatialNav) { window.__cinejoySpatialNav.refresh(); }"
-            )
+            if (BuildConfig.IS_TV_PLATFORM) {
+                safeEvaluateJs(
+                    webView,
+                    "if (window.__cinejoySpatialNav) { window.__cinejoySpatialNav.refresh(); }"
+                )
+            } else {
+                safeEvaluateJs(
+                    webView,
+                    "if (window.__cinejoyMobileHud) { window.__cinejoyMobileHud.refresh(); }"
+                )
+            }
         }
     }
 
     fun notifyRouteTransition(webView: WebView) {
         runOnUiImmediate(webView) {
+            if (BuildConfig.IS_TV_PLATFORM) {
+                safeEvaluateJs(
+                    webView,
+                    "if (window.__cinejoySpatialNav) { window.__cinejoySpatialNav.releaseOverlay(false); window.__cinejoySpatialNav.refresh(); }"
+                )
+            } else {
+                safeEvaluateJs(
+                    webView,
+                    "if (window.__cinejoyMobileHud) { window.__cinejoyMobileHud.refresh(); }"
+                )
+            }
+        }
+    }
+
+    fun releaseMediaForBackground(webView: WebView) {
+        runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,
-                "if (window.__cinejoySpatialNav) { window.__cinejoySpatialNav.releaseOverlay(false); window.__cinejoySpatialNav.refresh(); }"
+                "if (window.__cinejoyReleaseMedia) { window.__cinejoyReleaseMedia(true); }"
+            )
+        }
+    }
+
+    fun resumeMediaAfterForeground(webView: WebView) {
+        runOnUiImmediate(webView) {
+            safeEvaluateJs(
+                webView,
+                "if (window.__cinejoyResumeMedia) { window.__cinejoyResumeMedia(); }"
             )
         }
     }
 
     fun handleBackKey(webView: WebView, onNotDismissed: () -> Unit) {
+        if (!BuildConfig.IS_TV_PLATFORM) {
+            onNotDismissed()
+            return
+        }
         runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,
@@ -2177,7 +2499,7 @@ object SpatialNavigationEngine {
         runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,
-                "if (window.__cinejoySpatialNav) { window.__cinejoySpatialNav.releaseOverlay(true); }"
+                "if (window.__cinejoySpatialNav) { window.__cinejoySpatialNav.releaseOverlay(true); } else if (window.__cinejoyReleaseMedia) { window.__cinejoyReleaseMedia(false); }"
             ) {
                 webView.postDelayed({
                     if (webView.isAttachedToWindow && webView.canGoBack()) {
@@ -2190,14 +2512,24 @@ object SpatialNavigationEngine {
 
     fun onFullscreenChanged(webView: WebView, active: Boolean) {
         runOnUiImmediate(webView) {
-            safeEvaluateJs(
-                webView,
-                "if (window.__cinejoySpatialNav && window.__cinejoySpatialNav.onFullscreenChanged) { window.__cinejoySpatialNav.onFullscreenChanged($active); }"
-            )
+            if (BuildConfig.IS_TV_PLATFORM) {
+                safeEvaluateJs(
+                    webView,
+                    "if (window.__cinejoySpatialNav && window.__cinejoySpatialNav.onFullscreenChanged) { window.__cinejoySpatialNav.onFullscreenChanged($active); }"
+                )
+            } else {
+                safeEvaluateJs(
+                    webView,
+                    "if (window.__cinejoyMobileHud) { window.__cinejoyMobileHud.refresh(); }"
+                )
+            }
         }
     }
 
     fun moveFocus(webView: WebView, direction: String) {
+        if (!BuildConfig.IS_TV_PLATFORM) {
+            return
+        }
         runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,
@@ -2211,6 +2543,9 @@ object SpatialNavigationEngine {
         activeCustomView: View? = null,
         isFullscreenProvider: () -> Boolean = { false }
     ) {
+        if (!BuildConfig.IS_TV_PLATFORM) {
+            return
+        }
         runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,
@@ -2256,6 +2591,9 @@ object SpatialNavigationEngine {
     }
 
     fun toggleVideoPlayback(webView: WebView) {
+        if (!BuildConfig.IS_TV_PLATFORM) {
+            return
+        }
         runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,
@@ -2265,6 +2603,9 @@ object SpatialNavigationEngine {
     }
 
     fun seekVideo(webView: WebView, deltaSeconds: Int) {
+        if (!BuildConfig.IS_TV_PLATFORM) {
+            return
+        }
         runOnUiImmediate(webView) {
             safeEvaluateJs(
                 webView,

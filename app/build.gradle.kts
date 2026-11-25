@@ -21,7 +21,21 @@ android {
     }
 
     buildFeatures {
-        buildConfig = false
+        buildConfig = true
+    }
+
+    flavorDimensions += "platform"
+    productFlavors {
+        create("firestick") {
+            dimension = "platform"
+            applicationId = "pk.cinejoy.tv"
+            buildConfigField("boolean", "IS_TV_PLATFORM", "true")
+        }
+        create("android") {
+            dimension = "platform"
+            applicationId = "pk.cinejoy.mobile"
+            buildConfigField("boolean", "IS_TV_PLATFORM", "false")
+        }
     }
 
     signingConfigs {
@@ -64,6 +78,7 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
+        freeCompilerArgs.add("-opt-in=androidx.media3.common.util.UnstableApi")
     }
 }
 
@@ -71,4 +86,10 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
+    implementation("androidx.media3:media3-datasource-okhttp:1.5.1")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

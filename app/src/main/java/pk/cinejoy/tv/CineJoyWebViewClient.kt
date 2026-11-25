@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.net.http.SslError
 import android.os.Build
-import android.util.Log
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.WebResourceError
@@ -18,11 +17,11 @@ class CineJoyWebViewClient(
     private val onPageStart: (WebView, String) -> Unit,
     private val onLoadError: () -> Unit,
     private val onPageReady: (WebView, String) -> Unit,
-    private val onRouteChanged: (WebView, String) -> Unit
+    private val onRouteChanged: (WebView, String) -> Unit,
+    private val onRenderProcessCrashed: () -> Unit
 ) : WebViewClient() {
 
     companion object {
-        private const val TAG = "CineJoyWebView"
         private const val HOME_URL = "https://cinejoy.pk"
     }
 
@@ -54,6 +53,7 @@ class CineJoyWebViewClient(
         super.onPageStarted(view, url, favicon)
         if (view != null && url != null && url != "about:blank") {
             lastVisitedUrl = url
+            CineJoyApplication.saveLastUrl(view.context, url)
             onPageStart(view, url)
         }
     }
@@ -61,8 +61,8 @@ class CineJoyWebViewClient(
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
         if (view != null && url != null && url != "about:blank") {
-            Log.i(TAG, "Page finished: $url (blocked ads=${AdBlockerFilter.getBlockedCount()})")
             lastVisitedUrl = url
+            CineJoyApplication.saveLastUrl(view.context, url)
             onPageStart(view, url)
             onPageReady(view, url)
         }
@@ -74,6 +74,7 @@ class CineJoyWebViewClient(
             val wasWatch = lastVisitedUrl.contains("/watch/")
             val isWatch = url.contains("/watch/")
             lastVisitedUrl = url
+            CineJoyApplication.saveLastUrl(view.context, url)
             if (wasWatch || isWatch) {
                 SpatialNavigationEngine.notifyRouteTransition(view)
             }
@@ -86,7 +87,6 @@ class CineJoyWebViewClient(
         handler: SslErrorHandler?,
         error: SslError?
     ) {
-        Log.w(TAG, "Proceeding past SSL error url=${error?.url} code=${error?.primaryError}")
         handler?.proceed()
     }
 
@@ -99,9 +99,8 @@ class CineJoyWebViewClient(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && request?.isForMainFrame == true) {
             val failedUrl = request.url?.toString() ?: ""
             if (failedUrl != "about:blank") {
-                Log.e(TAG, "Main frame load error code=${error?.errorCode} desc=${error?.description} url=$failedUrl")
                 onLoadError()
-                loadErrorScreen(view, error?.description?.toString() ?: "Network unavailable")
+                loadErrorScreen(view, error?.description?.toString() ?: "Network unavailable", failedUrl)
             }
         }
     }
@@ -114,18 +113,13 @@ class CineJoyWebViewClient(
     ) {
         super.onReceivedError(view, errorCode, description, failingUrl)
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M && failingUrl != "about:blank") {
-            Log.e(TAG, "Legacy main frame load error code=$errorCode desc=$description url=$failingUrl")
             onLoadError()
-            loadErrorScreen(view, description ?: "Network unavailable")
+            loadErrorScreen(view, description ?: "Network unavailable", failingUrl ?: HOME_URL)
         }
     }
 
     override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Log.e(TAG, "WebView render process gone didCrash=${detail?.didCrash()}")
-        } else {
-            Log.e(TAG, "WebView render process gone")
-        }
+        onRenderProcessCrashed()
         return true
     }
 
@@ -139,11 +133,9 @@ class CineJoyWebViewClient(
         }
         val scheme = uri.scheme?.lowercase(Locale.US) ?: ""
         if (scheme != "http" && scheme != "https") {
-            Log.d(TAG, "Blocked non-HTTP scheme navigation: $rawUrl")
             return true
         }
         if (AdBlockerFilter.isBlocked(uri)) {
-            Log.d(TAG, "Blocked ad navigation: $rawUrl")
             return true
         }
         val host = uri.host
@@ -153,64 +145,106 @@ class CineJoyWebViewClient(
         if (!isMainFrame) {
             return false
         }
-        Log.d(TAG, "Blocked external main-frame navigation: $rawUrl")
         return true
     }
 
-    private fun loadErrorScreen(view: WebView?, message: String) {
+    private fun loadErrorScreen(view: WebView?, message: String, retryUrl: String) {
         if (view == null) {
             return
+        }
+        val targetRetryUrl = if (retryUrl.startsWith("https://") || retryUrl.startsWith("http://")) {
+            retryUrl
+        } else {
+            HOME_URL
         }
         val safeMessage = message
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace("\"", "&quot;")
+        val safeTargetUrl = targetRetryUrl
+            .replace("\\", "")
+            .replace("'", "")
+            .replace("\"", "")
         val html = """
             <!doctype html>
             <html>
             <head>
                 <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
                 <style>
                     body {
                         margin: 0;
-                        padding: 48px;
-                        background-color: rgb(10, 12, 14);
+                        padding: 36px;
+                        background-color: rgb(5, 5, 5);
                         color: rgb(235, 240, 245);
                         font-family: sans-serif;
                         display: flex;
                         flex-direction: column;
                         align-items: center;
                         justify-content: center;
-                        min-height: 80vh;
+                        min-height: 85vh;
                         text-align: center;
                     }
                     h1 {
                         color: rgb(255, 255, 0);
-                        font-size: 32px;
-                        margin-bottom: 16px;
+                        font-size: 28px;
+                        margin-bottom: 14px;
                     }
                     p {
                         color: rgb(180, 190, 200);
-                        font-size: 18px;
-                        margin-bottom: 28px;
+                        font-size: 16px;
+                        margin-bottom: 12px;
+                    }
+                    #retryStatus {
+                        color: rgb(140, 150, 160);
+                        font-size: 14px;
+                        margin-bottom: 24px;
                     }
                     button {
                         background-color: rgb(255, 255, 0);
-                        color: rgb(10, 12, 14);
+                        color: rgb(5, 5, 5);
                         border: none;
                         border-radius: 8px;
                         padding: 14px 32px;
-                        font-size: 18px;
+                        font-size: 17px;
                         font-weight: bold;
                         cursor: pointer;
+                    }
+                    button:focus {
+                        outline: 3px solid rgb(255, 255, 255);
+                        outline-offset: 3px;
                     }
                 </style>
             </head>
             <body>
-                <h1>CineJoy TV Connection Issue</h1>
+                <h1>CineJoy Connection Issue</h1>
                 <p>$safeMessage</p>
-                <button onclick="window.location.replace('$HOME_URL')">Retry Connection</button>
+                <p id="retryStatus">Retrying automatically...</p>
+                <button id="retryBtn" autofocus onclick="window.location.replace('$safeTargetUrl')">Retry Now</button>
+                <script>
+                    (function() {
+                        var attempt = 0;
+                        try {
+                            attempt = parseInt(sessionStorage.getItem("__cj_nav_retry") || "0", 10) || 0;
+                        } catch (e) {}
+                        var delayMs = Math.min(3000 * Math.pow(2, Math.min(attempt, 2)), 12000);
+                        try {
+                            sessionStorage.setItem("__cj_nav_retry", String(attempt + 1));
+                        } catch (e2) {}
+                        var statusEl = document.getElementById("retryStatus");
+                        if (statusEl) {
+                            statusEl.textContent = "Retrying in " + Math.round(delayMs / 1000) + "s...";
+                        }
+                        var btn = document.getElementById("retryBtn");
+                        if (btn && typeof btn.focus === "function") {
+                            btn.focus();
+                        }
+                        setTimeout(function() {
+                            window.location.replace('$safeTargetUrl');
+                        }, delayMs);
+                    })();
+                </script>
             </body>
             </html>
         """.trimIndent()

@@ -2,8 +2,9 @@ package pk.cinejoy.tv
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.Uri
 import android.os.Message
-import android.util.Log
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -17,11 +18,6 @@ class FullscreenWebChromeClient(
     private val onEnterFullscreen: () -> Unit,
     private val onExitFullscreen: () -> Unit
 ) : WebChromeClient() {
-
-    companion object {
-        private const val TAG_FULLSCREEN = "CineJoyFullscreen"
-        private const val TAG_CONSOLE = "CineJoyConsole"
-    }
 
     private var activeCustomView: View? = null
     private var activeCustomViewCallback: CustomViewCallback? = null
@@ -64,7 +60,6 @@ class FullscreenWebChromeClient(
 
         onEnterFullscreen()
         view.requestFocus()
-        Log.i(TAG_FULLSCREEN, "Entered fullscreen video mode")
     }
 
     override fun onHideCustomView() {
@@ -89,13 +84,12 @@ class FullscreenWebChromeClient(
 
         currentCallback?.onCustomViewHidden()
         onExitFullscreen()
-        Log.i(TAG_FULLSCREEN, "Exited fullscreen video mode and restored WebView")
     }
 
     override fun getDefaultVideoPoster(): Bitmap = defaultPosterBitmap
 
     private fun clearViewBackgrounds(target: View) {
-        if (target !is android.view.SurfaceView) {
+        if (target !is SurfaceView) {
             target.setBackgroundColor(Color.TRANSPARENT)
             target.setLayerType(View.LAYER_TYPE_NONE, null)
         }
@@ -114,36 +108,16 @@ class FullscreenWebChromeClient(
     ): Boolean {
         val targetUrl = view?.hitTestResult?.extra
         if (!targetUrl.isNullOrBlank()) {
-            val uri = android.net.Uri.parse(targetUrl)
+            val uri = Uri.parse(targetUrl)
             val scheme = uri.scheme?.lowercase()
             if ((scheme == "https" || scheme == "http") && AdBlockerFilter.isCineJoyHost(uri.host)) {
-                Log.d(TAG_FULLSCREEN, "Redirecting same-origin popup into main WebView: $targetUrl")
                 webView.loadUrl(targetUrl)
-            } else {
-                Log.d(TAG_FULLSCREEN, "Blocked external popup window attempt: $targetUrl")
             }
-        } else {
-            Log.d(TAG_FULLSCREEN, "Blocked blank popup window attempt")
         }
         return false
     }
 
     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-        if (consoleMessage != null) {
-            val msg = consoleMessage.message()
-            val line = "$msg (line ${consoleMessage.lineNumber()})"
-            when (consoleMessage.messageLevel()) {
-                ConsoleMessage.MessageLevel.ERROR -> Log.e(TAG_CONSOLE, line)
-                ConsoleMessage.MessageLevel.WARNING -> Log.w(TAG_CONSOLE, line)
-                else -> {
-                    if (msg.startsWith("[CineJoyNav]")) {
-                        Log.i(TAG_CONSOLE, line)
-                    } else {
-                        Log.d(TAG_CONSOLE, line)
-                    }
-                }
-            }
-        }
         return true
     }
 }

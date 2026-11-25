@@ -1,7 +1,7 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-APK_DIR="${APK_DIR:-${SCRIPT_DIR}/app/build/outputs/apk/release}"
+APK_DIR="${APK_DIR:-${SCRIPT_DIR}/app/build/outputs/apk/firestick/release}"
 PORT="${PORT:-8000}"
 
 if [ ! -d "${APK_DIR}" ]; then
@@ -30,6 +30,6 @@ fi
 
 printf "Serving APK directory: %s\n" "${APK_DIR}"
 printf "Enter this URL into AFTVnews Downloader on your Fire TV:\n"
-printf "  http://%s:%s/app-release.apk\n\n" "${LAN_IP}" "${PORT}"
+printf "  http://%s:%s/app-firestick-release.apk\n\n" "${LAN_IP}" "${PORT}"
 
 exec python3 -m http.server "${PORT}" --directory "${APK_DIR}"

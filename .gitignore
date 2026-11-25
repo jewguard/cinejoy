@@ -33,3 +33,10 @@ Desktop.ini
 *.ap_
 *.dex
 output-metadata.json
+ios/CineJoy.xcodeproj/
+ios/DerivedData/
+ios/Payload/
+release-assets/
+*.ipa
+*.xcarchive
+xcuserdata/

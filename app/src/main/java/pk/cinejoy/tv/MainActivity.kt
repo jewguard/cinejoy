@@ -1,13 +1,16 @@
 package pk.cinejoy.tv
 
-import android.content.pm.ApplicationInfo
+import android.app.PictureInPictureParams
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import android.os.SystemClock
+import android.util.Rational
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -22,47 +25,54 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageView
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.PlayerView
+import org.json.JSONObject
 
+@OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val TAG = "CineJoyMain"
-        private const val TARGET_URL = "https://cinejoy.pk"
         private const val NATIVE_BRIDGE_NAME = "__cinejoyNative"
         private const val SPLASH_FALLBACK_TIMEOUT_MS = 7000L
         private const val DESKTOP_TV_USER_AGENT =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        private const val MOBILE_ANDROID_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
     }
 
     private lateinit var rootContainer: FrameLayout
     private lateinit var cinejoyWebView: WebView
+    private lateinit var nativePlayerView: PlayerView
+    private lateinit var exoPlayerController: CineJoyExoPlayerController
     private lateinit var fullscreenChromeClient: FullscreenWebChromeClient
     private var splashOverlayView: FrameLayout? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isWebViewDestroyed = false
     private var isWatchSurfaceTransparent = false
     private var isInitialContentReady = false
+    private var isForegroundPausedForBackground = false
     private var hoverStep = 0
-    private val splashFallbackRunnable = Runnable { markInitialContentReady("timeout") }
+    private val splashFallbackRunnable = Runnable { markInitialContentReady() }
 
     private inner class CineJoyNativeBridge {
         @JavascriptInterface
         fun releaseVideoOverlay() {
-            Log.i(TAG, "Recycling WebView video overlay handles")
             Thread {
-                runFinalizationPass()
+                Runtime.getRuntime().gc()
                 try {
                     Thread.sleep(120L)
                 } catch (_: InterruptedException) {
                     return@Thread
                 }
-                runFinalizationPass()
+                Runtime.getRuntime().gc()
             }.start()
         }
 
@@ -73,7 +83,7 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun onWebContentRendered() {
-            this@MainActivity.markInitialContentReady("web_hydrated")
+            this@MainActivity.markInitialContentReady()
         }
 
         @JavascriptInterface
@@ -91,6 +101,33 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun openNativePlayer(streamUrl: String?, headersJson: String?, startPositionMs: Long) {
+            if (streamUrl.isNullOrBlank()) {
+                return
+            }
+            val parsedHeaders = mutableMapOf<String, String>()
+            if (!headersJson.isNullOrBlank()) {
+                try {
+                    val obj = JSONObject(headersJson)
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val value = obj.optString(key, "")
+                        if (key.isNotBlank() && value.isNotBlank()) {
+                            parsedHeaders[key] = value
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            runOnUiThread {
+                if (!isWebViewDestroyed && ::exoPlayerController.isInitialized) {
+                    exoPlayerController.openStream(streamUrl, parsedHeaders, startPositionMs)
+                }
+            }
+        }
+
+        @JavascriptInterface
         fun pulseMouseHover() {
             runOnUiThread {
                 if (!isWebViewDestroyed && ::cinejoyWebView.isInitialized && cinejoyWebView.width > 0 && cinejoyWebView.height > 0) {
@@ -101,7 +138,7 @@ class MainActivity : AppCompatActivity() {
                         null
                     }
                     val targets = listOfNotNull(activeView, cinejoyWebView)
-                    val now = android.os.SystemClock.uptimeMillis()
+                    val now = SystemClock.uptimeMillis()
                     for (target in targets) {
                         val tw = if (target.width > 0) target.width.toFloat() else cinejoyWebView.width.toFloat()
                         val th = if (target.height > 0) target.height.toFloat() else cinejoyWebView.height.toFloat()
@@ -123,10 +160,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-        }
-
-        private fun runFinalizationPass() {
-            Runtime.getRuntime().gc()
         }
     }
 
@@ -152,37 +185,77 @@ class MainActivity : AppCompatActivity() {
 
         rootContainer = findViewById(R.id.rootContainer)
         cinejoyWebView = findViewById(R.id.cinejoyWebView)
+        nativePlayerView = findViewById(R.id.nativePlayerView)
 
         val opaqueDark = Color.rgb(5, 5, 5)
         rootContainer.setBackgroundColor(opaqueDark)
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             attachBrandedSplashOverlay(opaqueDark)
         }
+
+        exoPlayerController = CineJoyExoPlayerController(
+            activity = this,
+            playerView = nativePlayerView,
+            isInPipProvider = { isInPictureInPictureModeCompat() },
+            onStateChanged = { nativeActive ->
+                if (!isWebViewDestroyed && ::cinejoyWebView.isInitialized) {
+                    cinejoyWebView.visibility = if (nativeActive) View.GONE else View.VISIBLE
+                }
+                if (!BuildConfig.IS_TV_PLATFORM) {
+                    requestedOrientation = if (nativeActive || (::fullscreenChromeClient.isInitialized && fullscreenChromeClient.isFullscreenActive())) {
+                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    } else {
+                        ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+                    }
+                }
+            }
+        )
+        lifecycle.addObserver(exoPlayerController)
+
         enterFullscreenImmersiveMode()
-        configureWebViewEngine()
+        attachWebViewComponents(cinejoyWebView)
+
+        if (BuildConfig.IS_TV_PLATFORM) {
+            configurePreferred4kDisplayMode()
+        }
+
+        val initialUrl = CineJoyApplication.consumeRecoveryUrl(this)
+        cinejoyWebView.loadUrl(initialUrl)
+    }
+
+    private fun attachWebViewComponents(targetWebView: WebView) {
+        cinejoyWebView = targetWebView
+        configureWebViewEngine(targetWebView)
 
         fullscreenChromeClient = FullscreenWebChromeClient(
             rootContainer = rootContainer,
-            webView = cinejoyWebView,
+            webView = targetWebView,
             onEnterFullscreen = {
                 setWatchSurfaceTransparent(true)
+                if (!BuildConfig.IS_TV_PLATFORM) {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                }
                 enterFullscreenImmersiveMode()
-                SpatialNavigationEngine.onFullscreenChanged(cinejoyWebView, true)
+                SpatialNavigationEngine.onFullscreenChanged(targetWebView, true)
             },
             onExitFullscreen = {
-                setWatchSurfaceTransparent(cinejoyWebView.url?.contains("/watch/") == true)
+                val onWatch = targetWebView.url?.contains("/watch/") == true
+                setWatchSurfaceTransparent(onWatch)
+                if (!BuildConfig.IS_TV_PLATFORM && !exoPlayerController.isVisible()) {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+                }
                 enterFullscreenImmersiveMode()
-                SpatialNavigationEngine.onFullscreenChanged(cinejoyWebView, false)
+                SpatialNavigationEngine.onFullscreenChanged(targetWebView, false)
             }
         )
 
-        cinejoyWebView.webViewClient = CineJoyWebViewClient(
+        targetWebView.webViewClient = CineJoyWebViewClient(
             onPageStart = { webView, url ->
                 setWatchSurfaceTransparent(url.contains("/watch/"))
-                SpatialNavigationEngine.applyFast4kPresets(webView)
+                SpatialNavigationEngine.applyNetworkAndPresets(webView)
             },
             onLoadError = {
-                markInitialContentReady("error_fallback")
+                markInitialContentReady()
             },
             onPageReady = { webView, url ->
                 setWatchSurfaceTransparent(url.contains("/watch/"))
@@ -191,13 +264,49 @@ class MainActivity : AppCompatActivity() {
             onRouteChanged = { webView, url ->
                 setWatchSurfaceTransparent(url.contains("/watch/"))
                 SpatialNavigationEngine.refreshMap(webView)
+            },
+            onRenderProcessCrashed = {
+                recoverFromWebViewCrash()
             }
         )
-        cinejoyWebView.webChromeClient = fullscreenChromeClient
+        targetWebView.webChromeClient = fullscreenChromeClient
+    }
 
-        configurePreferred4kDisplayMode()
-        Log.i(TAG, "Loading target streaming platform: $TARGET_URL")
-        cinejoyWebView.loadUrl(TARGET_URL)
+    private fun recoverFromWebViewCrash() {
+        runOnUiThread {
+            if (isDestroyed || isFinishing || !::rootContainer.isInitialized) {
+                return@runOnUiThread
+            }
+            if (::fullscreenChromeClient.isInitialized && fullscreenChromeClient.isFullscreenActive()) {
+                fullscreenChromeClient.onHideCustomView()
+            }
+            val oldWebView = cinejoyWebView
+            try {
+                oldWebView.removeJavascriptInterface(NATIVE_BRIDGE_NAME)
+                rootContainer.removeView(oldWebView)
+                oldWebView.stopLoading()
+                oldWebView.webChromeClient = null
+                oldWebView.webViewClient = WebViewClient()
+                oldWebView.removeAllViews()
+                oldWebView.destroy()
+            } catch (_: Throwable) {
+            }
+
+            val freshWebView = WebView(this).apply {
+                id = R.id.cinejoyWebView
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                setBackgroundColor(Color.rgb(5, 5, 5))
+                isFocusable = true
+                isFocusableInTouchMode = true
+            }
+            rootContainer.addView(freshWebView, 0)
+            isWatchSurfaceTransparent = false
+            attachWebViewComponents(freshWebView)
+            freshWebView.loadUrl(CineJoyApplication.consumeRecoveryUrl(this))
+        }
     }
 
     private fun attachBrandedSplashOverlay(backgroundColor: Int) {
@@ -224,7 +333,7 @@ class MainActivity : AppCompatActivity() {
         splashOverlayView = overlay
     }
 
-    private fun markInitialContentReady(reason: String) {
+    private fun markInitialContentReady() {
         val complete = {
             if (!isInitialContentReady) {
                 isInitialContentReady = true
@@ -245,7 +354,6 @@ class MainActivity : AppCompatActivity() {
                         }
                         .start()
                 }
-                Log.i(TAG, "Splash screen dismissed cleanly ($reason)")
             }
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -264,13 +372,11 @@ class MainActivity : AppCompatActivity() {
                         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
                         rootContainer.setBackgroundColor(Color.TRANSPARENT)
                         cinejoyWebView.setBackgroundColor(Color.TRANSPARENT)
-                        Log.i(TAG, "Surface switched to TRANSPARENT for watch playback")
                     } else {
                         val opaqueDark = Color.rgb(5, 5, 5)
                         window.setBackgroundDrawable(ColorDrawable(opaqueDark))
                         rootContainer.setBackgroundColor(opaqueDark)
                         cinejoyWebView.setBackgroundColor(opaqueDark)
-                        Log.i(TAG, "Surface switched to OPAQUE for browsing")
                     }
                 }
             }
@@ -294,7 +400,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val activeDisplay = ContextCompat.getDisplayOrDefault(this)
-
         val modes = activeDisplay.supportedModes
         if (modes.isEmpty()) {
             return
@@ -317,22 +422,18 @@ class MainActivity : AppCompatActivity() {
         val params = window.attributes
         params.preferredDisplayModeId = bestMode.modeId
         window.attributes = params
-        Log.i(
-            TAG,
-            "Preferred display mode selected: ${bestMode.physicalWidth}x${bestMode.physicalHeight}@${bestMode.refreshRate}Hz (id=${bestMode.modeId})"
-        )
     }
 
-    private fun configureWebViewEngine() {
-        if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
-            WebView.setWebContentsDebuggingEnabled(true)
-        }
-
-        val settings = cinejoyWebView.settings
+    private fun configureWebViewEngine(targetWebView: WebView) {
+        val settings = targetWebView.settings
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
-        settings.userAgentString = DESKTOP_TV_USER_AGENT
+        settings.userAgentString = if (BuildConfig.IS_TV_PLATFORM) {
+            DESKTOP_TV_USER_AGENT
+        } else {
+            MOBILE_ANDROID_USER_AGENT
+        }
         settings.loadWithOverviewMode = true
         settings.useWideViewPort = true
         settings.setSupportZoom(false)
@@ -351,14 +452,47 @@ class MainActivity : AppCompatActivity() {
 
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
-        cookieManager.setAcceptThirdPartyCookies(cinejoyWebView, true)
+        cookieManager.setAcceptThirdPartyCookies(targetWebView, true)
 
-        cinejoyWebView.addJavascriptInterface(CineJoyNativeBridge(), NATIVE_BRIDGE_NAME)
-        cinejoyWebView.setLayerType(View.LAYER_TYPE_NONE, null)
-        cinejoyWebView.setBackgroundColor(Color.rgb(5, 5, 5))
-        cinejoyWebView.isVerticalScrollBarEnabled = false
-        cinejoyWebView.isHorizontalScrollBarEnabled = false
-        cinejoyWebView.overScrollMode = View.OVER_SCROLL_NEVER
+        targetWebView.addJavascriptInterface(CineJoyNativeBridge(), NATIVE_BRIDGE_NAME)
+        targetWebView.setLayerType(View.LAYER_TYPE_NONE, null)
+        targetWebView.setBackgroundColor(Color.rgb(5, 5, 5))
+        targetWebView.isVerticalScrollBarEnabled = false
+        targetWebView.isHorizontalScrollBarEnabled = false
+        targetWebView.overScrollMode = View.OVER_SCROLL_NEVER
+    }
+
+    private fun isInPictureInPictureModeCompat(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (BuildConfig.IS_TV_PLATFORM || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return
+        }
+        val shouldPip = exoPlayerController.isPlaying() ||
+            (cinejoyWebView.url?.contains("/watch/") == true) ||
+            (::fullscreenChromeClient.isInitialized && fullscreenChromeClient.isFullscreenActive())
+        if (shouldPip) {
+            try {
+                val params = PictureInPictureParams.Builder()
+                    .setAspectRatio(Rational(16, 9))
+                    .build()
+                enterPictureInPictureMode(params)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (!isInPictureInPictureMode && !isWebViewDestroyed) {
+            enterFullscreenImmersiveMode()
+        }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -367,6 +501,30 @@ class MainActivity : AppCompatActivity() {
         }
         val keyCode = event.keyCode
         val action = event.action
+
+        if (::exoPlayerController.isInitialized && exoPlayerController.isVisible()) {
+            if (isHandledRemoteKey(keyCode)) {
+                if (action == KeyEvent.ACTION_DOWN) {
+                    exoPlayerController.handleKeyEvent(keyCode)
+                }
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
+
+        if (!BuildConfig.IS_TV_PLATFORM) {
+            if (keyCode == KeyEvent.KEYCODE_BACK && action == KeyEvent.ACTION_DOWN) {
+                if (::fullscreenChromeClient.isInitialized && fullscreenChromeClient.isFullscreenActive()) {
+                    fullscreenChromeClient.onHideCustomView()
+                } else if (cinejoyWebView.canGoBack()) {
+                    SpatialNavigationEngine.navigateBackCleanly(cinejoyWebView)
+                } else {
+                    finish()
+                }
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
 
         if (isHandledRemoteKey(keyCode)) {
             if (action == KeyEvent.ACTION_DOWN) {
@@ -463,26 +621,53 @@ class MainActivity : AppCompatActivity() {
         controller.show(WindowInsetsCompat.Type.systemBars())
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (!isWebViewDestroyed && isForegroundPausedForBackground) {
+            isForegroundPausedForBackground = false
+            cinejoyWebView.resumeTimers()
+            cinejoyWebView.onResume()
+            SpatialNavigationEngine.resumeMediaAfterForeground(cinejoyWebView)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         if (!isWebViewDestroyed) {
+            cinejoyWebView.resumeTimers()
             cinejoyWebView.onResume()
             enterFullscreenImmersiveMode()
         }
     }
 
     override fun onPause() {
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        if (!isWebViewDestroyed) {
-            cinejoyWebView.onPause()
+        if (!isInPictureInPictureModeCompat()) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (!isWebViewDestroyed) {
+                cinejoyWebView.onPause()
+            }
         }
         super.onPause()
+    }
+
+    override fun onStop() {
+        if (!isInPictureInPictureModeCompat() && !isWebViewDestroyed) {
+            isForegroundPausedForBackground = true
+            exoPlayerController.releaseForBackground()
+            SpatialNavigationEngine.releaseMediaForBackground(cinejoyWebView)
+            cinejoyWebView.onPause()
+            cinejoyWebView.pauseTimers()
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(splashFallbackRunnable)
         if (::fullscreenChromeClient.isInitialized && fullscreenChromeClient.isFullscreenActive()) {
             fullscreenChromeClient.onHideCustomView()
+        }
+        if (::exoPlayerController.isInitialized) {
+            exoPlayerController.closePlayer()
         }
         exitFullscreenImmersiveMode()
         if (::cinejoyWebView.isInitialized && !isWebViewDestroyed) {

@@ -1,0 +1,44 @@
+name: CineJoy
+options:
+  bundleIdPrefix: pk.cinejoy
+  deploymentTarget:
+    iOS: "16.4"
+targets:
+  CineJoy:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.4"
+    sources:
+      - path: CineJoy
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_NAME: CineJoy
+        PRODUCT_BUNDLE_IDENTIFIER: pk.cinejoy.ios
+        INFOPLIST_FILE: CineJoy/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+      configs:
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ""
+          GCC_PREPROCESSOR_DEFINITIONS: "NDEBUG=1"
+          ENABLE_NS_ASSERTIONS: "NO"
+          STRIP_INSTALLED_PRODUCT: "YES"
+          DEPLOYMENT_POSTPROCESSING: "YES"
+          DEAD_CODE_STRIPPING: "YES"
+          DEBUG_INFORMATION_FORMAT: "dwarf"
+    schemes:
+      CineJoy:
+        build:
+          targets:
+            CineJoy: all
+        archive:
+          config: Release

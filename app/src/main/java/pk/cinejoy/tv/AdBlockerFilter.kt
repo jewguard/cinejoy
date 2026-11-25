@@ -1,17 +1,11 @@
 package pk.cinejoy.tv
 
 import android.net.Uri
-import android.util.Log
 import android.webkit.WebResourceResponse
 import java.io.ByteArrayInputStream
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicInteger
 
 object AdBlockerFilter {
-
-    private const val TAG = "CineJoyAdBlock"
-
-    private val blockedRequestCount = AtomicInteger(0)
 
     private val blockedHosts: HashSet<String> = hashSetOf(
         "a.wing.st",
@@ -115,13 +109,11 @@ object AdBlockerFilter {
             }
         }
         if (matchesBlockedDomain(host)) {
-            recordBlock(host, path)
             return true
         }
         val fullTarget = uri.toString().lowercase(Locale.US)
         for (fragment in blockedPathFragments) {
             if (fullTarget.contains(fragment)) {
-                recordBlock(host, fragment)
                 return true
             }
         }
@@ -136,8 +128,6 @@ object AdBlockerFilter {
         )
     }
 
-    fun getBlockedCount(): Int = blockedRequestCount.get()
-
     private fun matchesBlockedDomain(host: String): Boolean {
         var current = host
         while (current.isNotEmpty()) {
@@ -151,12 +141,5 @@ object AdBlockerFilter {
             current = current.substring(dotIndex + 1)
         }
         return false
-    }
-
-    private fun recordBlock(host: String, detail: String) {
-        val count = blockedRequestCount.incrementAndGet()
-        if (count <= 15 || count % 25 == 0) {
-            Log.i(TAG, "Blocked request count=$count host=$host detail=$detail")
-        }
     }
 }

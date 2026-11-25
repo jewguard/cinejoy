@@ -3,7 +3,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 TARGET_IP="${1:-${FIRE_TV_IP:-}}"
 TARGET_PORT="${FIRE_TV_PORT:-5555}"
-APK_PATH="${APK_PATH:-${SCRIPT_DIR}/app/build/outputs/apk/release/app-release.apk}"
+APK_PATH="${APK_PATH:-${SCRIPT_DIR}/app/build/outputs/apk/firestick/release/app-firestick-release.apk}"
 PACKAGE_NAME="pk.cinejoy.tv"
 
 if [ -z "${TARGET_IP}" ]; then
