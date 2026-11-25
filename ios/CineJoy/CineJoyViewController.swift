@@ -1,20 +1,35 @@
 import UIKit
 import WebKit
 
-final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    private weak var delegate: WKScriptMessageHandler?
+
+    init(delegate: WKScriptMessageHandler) {
+        self.delegate = delegate
+        super.init()
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        delegate?.userContentController(userContentController, didReceive: message)
+    }
+}
+
+final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIScrollViewDelegate {
 
     private var webView: WKWebView!
     private var nativePlayerController: NativePlayerOverlayController!
     private var errorOverlayView: UIView?
     private var errorStatusLabel: UILabel?
     private var errorRetryTimer: Timer?
+    private var keyboardHideObserver: NSObjectProtocol?
     private var failedNavigationAttempt = 0
     private var lastFailedURL: URL?
     private var isWatchRoute = false
 
     private let backgroundDark = UIColor(red: 5.0 / 255.0, green: 5.0 / 255.0, blue: 5.0 / 255.0, alpha: 1.0)
-    private let iosSafariUserAgent =
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
         return .lightContent
@@ -38,6 +53,7 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         }
 
         configureWebView()
+        observeKeyboardReset()
         AdBlockerRules.compileContentRuleList { [weak self] ruleList in
             guard let self = self, let list = ruleList else { return }
             self.webView.configuration.userContentController.add(list)
@@ -49,6 +65,9 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
 
     deinit {
         errorRetryTimer?.invalidate()
+        if let obs = keyboardHideObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "cinejoyNative")
         nativePlayerController?.close()
     }
@@ -65,7 +84,7 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
 
     private func configureWebView() {
         let contentController = WKUserContentController()
-        contentController.add(self, name: "cinejoyNative")
+        contentController.add(WeakScriptMessageHandler(delegate: self), name: "cinejoyNative")
         contentController.addUserScript(
             WKUserScript(
                 source: CineJoyWebScripts.documentStartSource,
@@ -88,18 +107,24 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         config.allowsPictureInPictureMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.websiteDataStore = .default()
-        config.applicationNameForUserAgent = "CineJoy/1.0"
+        config.applicationNameForUserAgent = UIDevice.current.userInterfaceIdiom == .pad
+            ? "Version/18.0 Safari/604.1"
+            : "Version/18.0 Mobile/15E148 Safari/604.1"
 
         let wk = WKWebView(frame: .zero, configuration: config)
         wk.translatesAutoresizingMaskIntoConstraints = false
         wk.navigationDelegate = self
         wk.uiDelegate = self
-        wk.customUserAgent = iosSafariUserAgent
         wk.isOpaque = false
         wk.backgroundColor = backgroundDark
+        wk.scrollView.delegate = self
         wk.scrollView.backgroundColor = backgroundDark
         wk.scrollView.contentInsetAdjustmentBehavior = .never
-        wk.scrollView.bounces = false
+        wk.scrollView.bounces = true
+        wk.scrollView.alwaysBounceHorizontal = false
+        wk.scrollView.minimumZoomScale = 1.0
+        wk.scrollView.maximumZoomScale = 1.0
+        wk.scrollView.bouncesZoom = false
         wk.allowsBackForwardNavigationGestures = true
         wk.isInspectable = false
 
@@ -113,6 +138,31 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         webView = wk
     }
 
+    private func observeKeyboardReset() {
+        keyboardHideObserver = NotificationCenter.default.addObserver(
+            forName: UIResponder.keyboardWillHideNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, let wk = self.webView else { return }
+            DispatchQueue.main.async {
+                let sv = wk.scrollView
+                sv.setZoomScale(1.0, animated: false)
+                let maxY = max(0.0, sv.contentSize.height - sv.bounds.height)
+                let clampedY = min(max(0.0, sv.contentOffset.y), maxY)
+                sv.setContentOffset(CGPoint(x: 0.0, y: clampedY), animated: false)
+            }
+        }
+    }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        return nil
+    }
+
+    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+        scrollView.pinchGestureRecognizer?.isEnabled = false
+    }
+
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.name == "cinejoyNative",
               let dict = message.body as? [String: Any],
@@ -124,6 +174,7 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
             let nextWatch = (dict["isWatch"] as? Bool) ?? false
             if isWatchRoute != nextWatch {
                 isWatchRoute = nextWatch
+                webView.scrollView.bounces = !nextWatch
                 setNeedsStatusBarAppearanceUpdate()
                 setNeedsUpdateOfHomeIndicatorAutoHidden()
             }
@@ -189,6 +240,55 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         return nil
     }
 
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping () -> Void
+    ) {
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+            completionHandler()
+        })
+        present(alert, animated: true)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+            completionHandler(false)
+        })
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+            completionHandler(true)
+        })
+        present(alert, animated: true)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (String?) -> Void
+    ) {
+        let alert = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = defaultText
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+            completionHandler(nil)
+        })
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+            completionHandler(alert.textFields?.first?.text)
+        })
+        present(alert, animated: true)
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         hideErrorOverlay()
         failedNavigationAttempt = 0
@@ -229,6 +329,9 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
     private func handleLoadFailure(_ error: Error) {
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+            return
+        }
+        if nsError.domain == "WebKitErrorDomain" && (nsError.code == 101 || nsError.code == 102 || nsError.code == 104) {
             return
         }
         let target = nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL ?? webView.url ?? CrashGuard.homeURL

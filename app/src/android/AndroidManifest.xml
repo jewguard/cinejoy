@@ -12,7 +12,8 @@
             android:resizeableActivity="true"
             android:screenOrientation="fullUser"
             android:supportsPictureInPicture="true"
-            android:theme="@style/Theme.CineJoyTv.Starting">
+            android:theme="@style/Theme.CineJoyTv.Starting"
+            android:windowSoftInputMode="adjustResize">
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -35,10 +35,10 @@ enum CineJoyWebScripts {
             window.fetch = function(input, init) {
                 var url = (typeof input === "string") ? input : (input && input.url ? input.url : "");
                 var method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
-                if (method !== "GET" && method !== "HEAD" && !isMediaRetryUrl(url)) {
+                if (!isMediaRetryUrl(url) || (method !== "GET" && method !== "HEAD")) {
                     return origFetch(input, init);
                 }
-                var maxRetries = isMediaRetryUrl(url) ? 5 : 2;
+                var maxRetries = 5;
                 var signal = (init && init.signal) ? init.signal : (input && input.signal ? input.signal : null);
 
                 function execAttempt(attempt) {
@@ -94,18 +94,9 @@ enum CineJoyWebScripts {
                     if (!openArgs || openArgs.length < 2) {
                         return false;
                     }
-                    var method = String(openArgs[0] || "GET").toUpperCase();
                     var url = String(openArgs[1] || "");
                     var isAsync = openArgs.length < 3 ? true : (openArgs[2] !== false);
-                    if (!isAsync) {
-                        return false;
-                    }
-                    return isMediaRetryUrl(url) || method === "GET" || method === "HEAD";
-                }
-
-                function getMaxRetries() {
-                    var url = (openArgs && openArgs[1]) ? String(openArgs[1]) : "";
-                    return isMediaRetryUrl(url) ? 5 : 2;
+                    return isAsync && isMediaRetryUrl(url);
                 }
 
                 function emitEvent(type, evt) {
@@ -130,8 +121,7 @@ enum CineJoyWebScripts {
                 }
 
                 function scheduleRetry(fallbackEventType, evt) {
-                    var maxRetries = getMaxRetries();
-                    if (aborted || !shouldRetryRequest() || attempt >= maxRetries) {
+                    if (aborted || !shouldRetryRequest() || attempt >= 5) {
                         emitEvent("readystatechange", evt);
                         emitEvent(fallbackEventType, evt);
                         if (fallbackEventType !== "loadend") {
@@ -169,7 +159,7 @@ enum CineJoyWebScripts {
                     var retryPending = false;
                     target.onreadystatechange = function(evt) {
                         if (aborted) { return; }
-                        if (target.readyState === 4 && shouldRetryRequest() && isRetryableStatus(target.status) && attempt < getMaxRetries()) {
+                        if (target.readyState === 4 && shouldRetryRequest() && isRetryableStatus(target.status) && attempt < 5) {
                             retryPending = true;
                             return;
                         }
@@ -179,7 +169,7 @@ enum CineJoyWebScripts {
                     };
                     target.onload = function(evt) {
                         if (aborted) { return; }
-                        if (shouldRetryRequest() && isRetryableStatus(target.status) && attempt < getMaxRetries()) {
+                        if (shouldRetryRequest() && isRetryableStatus(target.status) && attempt < 5) {
                             retryPending = true;
                             scheduleRetry("load", evt);
                             return;
@@ -188,7 +178,7 @@ enum CineJoyWebScripts {
                     };
                     target.onerror = function(evt) {
                         if (aborted) { return; }
-                        if (shouldRetryRequest() && attempt < getMaxRetries()) {
+                        if (shouldRetryRequest() && attempt < 5) {
                             retryPending = true;
                             scheduleRetry("error", evt);
                             return;
@@ -197,7 +187,7 @@ enum CineJoyWebScripts {
                     };
                     target.ontimeout = function(evt) {
                         if (aborted) { return; }
-                        if (shouldRetryRequest() && attempt < getMaxRetries()) {
+                        if (shouldRetryRequest() && attempt < 5) {
                             retryPending = true;
                             scheduleRetry("timeout", evt);
                             return;
@@ -245,6 +235,9 @@ enum CineJoyWebScripts {
                 this.overrideMimeType = function(mime) {
                     currentMimeType = mime;
                     return real.overrideMimeType(mime);
+                };
+                this.dispatchEvent = function(evt) {
+                    return real.dispatchEvent(evt);
                 };
                 this.addEventListener = function(type, fn, opts) {
                     if (!listeners[type]) { listeners[type] = []; }
@@ -308,6 +301,7 @@ enum CineJoyWebScripts {
     window.__cinejoyReleaseMedia = function(preservePos) {
         try {
             var videos = document.querySelectorAll("video");
+            var hadVideo = videos.length > 0;
             var savedTime = 0;
             for (var i = 0; i < videos.length; i++) {
                 var v = videos[i];
@@ -319,7 +313,7 @@ enum CineJoyWebScripts {
                 try { v.srcObject = null; } catch (e3) {}
                 try { v.load(); } catch (e4) {}
             }
-            if (preservePos && location.pathname.indexOf("/watch/") !== -1) {
+            if (preservePos && hadVideo && location.pathname.indexOf("/watch/") !== -1) {
                 sessionStorage.setItem("__cj_bg_resume", JSON.stringify({
                     path: location.pathname,
                     time: savedTime,
@@ -398,20 +392,19 @@ enum CineJoyWebScripts {
     var STYLE_ATTR = "data-cinejoy-ios-style";
     var HUD_AUTO_HIDE_MS = 3000;
     var hudTimer = null;
+    var refreshTimer = null;
+    var watchGuardTimer = null;
     var boundVid = null;
     var lastReportedWatch = null;
     var contentReadySent = false;
 
     function ensureViewportMeta() {
-        var meta = document.querySelector('meta[name="viewport"]');
-        if (!meta) {
-            meta = document.createElement("meta");
+        var existing = document.querySelector('meta[name="viewport"]');
+        if (!existing) {
+            var meta = document.createElement("meta");
             meta.name = "viewport";
+            meta.setAttribute("content", "width=device-width, initial-scale=1, viewport-fit=cover");
             (document.head || document.documentElement).appendChild(meta);
-        }
-        var cur = meta.getAttribute("content") || "";
-        if (cur.indexOf("viewport-fit=cover") === -1) {
-            meta.setAttribute("content", "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover");
         }
     }
 
@@ -423,14 +416,34 @@ enum CineJoyWebScripts {
         style.setAttribute(STYLE_ATTR, "true");
         style.type = "text/css";
         style.textContent =
-            "html, body { background-color: rgb(5, 5, 5) !important; -webkit-tap-highlight-color: transparent; }" +
-            "body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }" +
-            "html." + WATCH_CLASS + ", html." + WATCH_CLASS + " > body { padding: 0 !important; }" +
+            "html { overflow-x: clip !important; -webkit-text-size-adjust: 100% !important; }" +
+            "html, body { background-color: rgb(5, 5, 5) !important; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }" +
+            "button, a, input, textarea, select { touch-action: manipulation; }" +
+            "input, textarea, select { font-size: 16px !important; }" +
             "[data-cj-hud-chrome=\"1\"] { transition: opacity 180ms ease !important; }" +
             "html." + WATCH_CLASS + "." + HUD_HIDDEN_CLASS + " [data-cj-hud-chrome=\"1\"] { opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }";
         var target = document.head || document.documentElement;
         if (target) {
             target.appendChild(style);
+        }
+    }
+
+    function repositionAddMenuForKeyboard() {
+        var menu = document.querySelector(".add-menu");
+        if (!menu) {
+            return;
+        }
+        var active = document.activeElement;
+        var inMenuInput = !!(active && menu.contains(active) && (active.tagName === "INPUT" || active.tagName === "TEXTAREA"));
+        var vv = window.visualViewport;
+        if (inMenuInput && vv && vv.height < window.innerHeight * 0.78) {
+            var r = menu.getBoundingClientRect();
+            var topPx = Math.max(16, (vv.height - r.height) / 2) + (vv.offsetTop || 0);
+            menu.style.setProperty("top", Math.round(topPx) + "px", "important");
+            menu.style.setProperty("transform", "translateX(-50%)", "important");
+        } else {
+            menu.style.removeProperty("top");
+            menu.style.removeProperty("transform");
         }
     }
 
@@ -491,6 +504,17 @@ enum CineJoyWebScripts {
         return false;
     }
 
+    function hasMountedPlayerControls() {
+        var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root");
+        if (!root) {
+            return false;
+        }
+        if (root.classList && root.classList.contains("cursor-none")) {
+            return false;
+        }
+        return root.querySelectorAll("button").length > 0;
+    }
+
     function markHudChrome() {
         var vid = document.querySelector("video");
         var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root") || (vid ? vid.parentElement : null);
@@ -546,11 +570,6 @@ enum CineJoyWebScripts {
         hudTimer = setTimeout(hideHud, HUD_AUTO_HIDE_MS);
     }
 
-    function wakeHud() {
-        document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
-        scheduleHide();
-    }
-
     function applyVideoHardwareAttributes(vid) {
         if (!vid) {
             return;
@@ -570,11 +589,26 @@ enum CineJoyWebScripts {
         }
     }
 
+    function syncWatchGuardTimer(onWatch) {
+        if (onWatch && !watchGuardTimer) {
+            watchGuardTimer = setInterval(function() {
+                if (isWatchRoute()) {
+                    refresh();
+                }
+            }, 3000);
+        } else if (!onWatch && watchGuardTimer) {
+            clearInterval(watchGuardTimer);
+            watchGuardTimer = null;
+        }
+    }
+
     function refresh() {
         ensureViewportMeta();
         injectSafeAreaAndHudStyles();
+        repositionAddMenuForKeyboard();
         var onWatch = isWatchRoute();
         reportRouteState(onWatch);
+        syncWatchGuardTimer(onWatch);
         if (onWatch) {
             document.documentElement.classList.add(WATCH_CLASS);
             markHudChrome();
@@ -599,9 +633,66 @@ enum CineJoyWebScripts {
         }
     }
 
-    document.addEventListener("touchstart", wakeHud, { passive: true, capture: true });
-    document.addEventListener("pointerdown", wakeHud, { passive: true, capture: true });
-    document.addEventListener("click", wakeHud, true);
+    function scheduleDebouncedRefresh() {
+        if (refreshTimer) {
+            clearTimeout(refreshTimer);
+        }
+        refreshTimer = setTimeout(refresh, 160);
+    }
+
+    document.addEventListener("click", function(e) {
+        if (!isWatchRoute()) {
+            return;
+        }
+        if (document.documentElement.classList.contains(HUD_HIDDEN_CLASS)) {
+            var mounted = hasMountedPlayerControls();
+            document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
+            scheduleHide();
+            if (mounted) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+            return;
+        }
+        scheduleHide();
+    }, true);
+
+    document.addEventListener("focusin", function() {
+        setTimeout(repositionAddMenuForKeyboard, 80);
+    }, true);
+    document.addEventListener("focusout", function() {
+        setTimeout(repositionAddMenuForKeyboard, 120);
+    }, true);
+
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", repositionAddMenuForKeyboard);
+        window.visualViewport.addEventListener("scroll", repositionAddMenuForKeyboard);
+    }
+
+    if (window.history) {
+        var origPushState = window.history.pushState;
+        if (typeof origPushState === "function") {
+            window.history.pushState = function() {
+                var ret = origPushState.apply(this, arguments);
+                scheduleDebouncedRefresh();
+                return ret;
+            };
+        }
+        var origReplaceState = window.history.replaceState;
+        if (typeof origReplaceState === "function") {
+            window.history.replaceState = function() {
+                var ret = origReplaceState.apply(this, arguments);
+                scheduleDebouncedRefresh();
+                return ret;
+            };
+        }
+    }
+    window.addEventListener("popstate", scheduleDebouncedRefresh);
+
+    if (typeof MutationObserver !== "undefined" && document.body) {
+        var observer = new MutationObserver(scheduleDebouncedRefresh);
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
 
     window.__cinejoyIosController = {
         initialized: true,
@@ -609,7 +700,6 @@ enum CineJoyWebScripts {
     };
 
     refresh();
-    setInterval(refresh, 1500);
 })();
 """
 }

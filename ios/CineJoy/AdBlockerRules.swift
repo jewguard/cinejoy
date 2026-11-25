@@ -118,7 +118,7 @@ enum AdBlockerRules {
             let rule: [String: Any] = [
                 "trigger": [
                     "url-filter": "^https?://([^/]+\\.)?" + escaped + "(/|$)",
-                    "unless-domain": ["cinejoy.pk", "*.cinejoy.pk", "tmdb.org", "*.tmdb.org"]
+                    "unless-domain": ["*cinejoy.pk", "*tmdb.org"]
                 ],
                 "action": [
                     "type": "block"
@@ -131,7 +131,7 @@ enum AdBlockerRules {
             let rule: [String: Any] = [
                 "trigger": [
                     "url-filter": escaped,
-                    "unless-domain": ["cinejoy.pk", "*.cinejoy.pk", "tmdb.org", "*.tmdb.org"]
+                    "unless-domain": ["*cinejoy.pk", "*tmdb.org"]
                 ],
                 "action": [
                     "type": "block"

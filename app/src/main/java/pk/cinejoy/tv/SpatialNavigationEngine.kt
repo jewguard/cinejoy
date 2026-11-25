@@ -42,10 +42,10 @@ object SpatialNavigationEngine {
             window.fetch = function(input, init) {
                 var url = (typeof input === "string") ? input : (input && input.url ? input.url : "");
                 var method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
-                if (method !== "GET" && method !== "HEAD" && !isMediaRetryUrl(url)) {
+                if (!isMediaRetryUrl(url) || (method !== "GET" && method !== "HEAD")) {
                     return origFetch(input, init);
                 }
-                var maxRetries = isMediaRetryUrl(url) ? 5 : 2;
+                var maxRetries = 5;
                 var signal = (init && init.signal) ? init.signal : (input && input.signal ? input.signal : null);
 
                 function execAttempt(attempt) {
@@ -101,18 +101,9 @@ object SpatialNavigationEngine {
                     if (!openArgs || openArgs.length < 2) {
                         return false;
                     }
-                    var method = String(openArgs[0] || "GET").toUpperCase();
                     var url = String(openArgs[1] || "");
                     var isAsync = openArgs.length < 3 ? true : (openArgs[2] !== false);
-                    if (!isAsync) {
-                        return false;
-                    }
-                    return isMediaRetryUrl(url) || method === "GET" || method === "HEAD";
-                }
-
-                function getMaxRetries() {
-                    var url = (openArgs && openArgs[1]) ? String(openArgs[1]) : "";
-                    return isMediaRetryUrl(url) ? 5 : 2;
+                    return isAsync && isMediaRetryUrl(url);
                 }
 
                 function emitEvent(type, evt) {
@@ -137,8 +128,7 @@ object SpatialNavigationEngine {
                 }
 
                 function scheduleRetry(fallbackEventType, evt) {
-                    var maxRetries = getMaxRetries();
-                    if (aborted || !shouldRetryRequest() || attempt >= maxRetries) {
+                    if (aborted || !shouldRetryRequest() || attempt >= 5) {
                         emitEvent("readystatechange", evt);
                         emitEvent(fallbackEventType, evt);
                         if (fallbackEventType !== "loadend") {
@@ -178,7 +168,7 @@ object SpatialNavigationEngine {
                         if (aborted) {
                             return;
                         }
-                        if (target.readyState === 4 && shouldRetryRequest() && isRetryableStatus(target.status) && attempt < getMaxRetries()) {
+                        if (target.readyState === 4 && shouldRetryRequest() && isRetryableStatus(target.status) && attempt < 5) {
                             retryPendingForThisInstance = true;
                             return;
                         }
@@ -190,7 +180,7 @@ object SpatialNavigationEngine {
                         if (aborted) {
                             return;
                         }
-                        if (shouldRetryRequest() && isRetryableStatus(target.status) && attempt < getMaxRetries()) {
+                        if (shouldRetryRequest() && isRetryableStatus(target.status) && attempt < 5) {
                             retryPendingForThisInstance = true;
                             scheduleRetry("load", evt);
                             return;
@@ -201,7 +191,7 @@ object SpatialNavigationEngine {
                         if (aborted) {
                             return;
                         }
-                        if (shouldRetryRequest() && attempt < getMaxRetries()) {
+                        if (shouldRetryRequest() && attempt < 5) {
                             retryPendingForThisInstance = true;
                             scheduleRetry("error", evt);
                             return;
@@ -212,7 +202,7 @@ object SpatialNavigationEngine {
                         if (aborted) {
                             return;
                         }
-                        if (shouldRetryRequest() && attempt < getMaxRetries()) {
+                        if (shouldRetryRequest() && attempt < 5) {
                             retryPendingForThisInstance = true;
                             scheduleRetry("timeout", evt);
                             return;
@@ -278,6 +268,9 @@ object SpatialNavigationEngine {
                 this.overrideMimeType = function(mime) {
                     currentMimeType = mime;
                     return real.overrideMimeType(mime);
+                };
+                this.dispatchEvent = function(evt) {
+                    return real.dispatchEvent(evt);
                 };
                 this.addEventListener = function(type, fn, opts) {
                     if (!listeners[type]) {
@@ -349,6 +342,7 @@ object SpatialNavigationEngine {
     window.__cinejoyReleaseMedia = function(preservePos) {
         try {
             var videos = document.querySelectorAll("video");
+            var hadVideo = videos.length > 0;
             var savedTime = 0;
             for (var i = 0; i < videos.length; i++) {
                 var v = videos[i];
@@ -360,7 +354,7 @@ object SpatialNavigationEngine {
                 try { v.srcObject = null; } catch (e3) {}
                 try { v.load(); } catch (e4) {}
             }
-            if (preservePos && location.pathname.indexOf("/watch/") !== -1) {
+            if (preservePos && hadVideo && location.pathname.indexOf("/watch/") !== -1) {
                 sessionStorage.setItem("__cj_bg_resume", JSON.stringify({
                     path: location.pathname,
                     time: savedTime,
@@ -476,6 +470,7 @@ object SpatialNavigationEngine {
         refreshTimer: null,
         scrollTimer: null,
         hudWakeTimer: null,
+        hudRetryWakeTimer: null,
         watchdogTimer: null,
         clickListenerInstalled: false,
         lastWatchReported: null,
@@ -512,33 +507,55 @@ object SpatialNavigationEngine {
         } catch (e) {}
     }
 
-    function wakePlayerHud() {
+    function dispatchPointerSweep(root) {
         state.wakeStep = (state.wakeStep || 0) + 1;
-        var wx = 320 + ((state.wakeStep % 5) * 40);
-        var wy = 240 + ((state.wakeStep % 3) * 30);
-        var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root") || document.body;
-        if (!root) {
-            return;
-        }
+        var wx = 280 + ((state.wakeStep % 5) * 40);
+        var wy = 220 + ((state.wakeStep % 3) * 30);
+        var points = [[wx, wy], [wx + 32, wy + 18]];
         var targets = [root, document];
         for (var i = 0; i < targets.length; i++) {
             var t = targets[i];
-            try {
-                t.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, cancelable: true, view: window, clientX: wx, clientY: wy }));
-                t.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window, clientX: wx, clientY: wy }));
-            } catch (e) {}
-            try {
-                if (typeof PointerEvent !== "undefined") {
-                    t.dispatchEvent(new PointerEvent("pointerenter", { bubbles: true, cancelable: true, view: window, clientX: wx, clientY: wy, pointerType: "mouse", isPrimary: true }));
-                    t.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, cancelable: true, view: window, clientX: wx, clientY: wy, pointerType: "mouse", isPrimary: true }));
-                }
-            } catch (e2) {}
+            for (var p = 0; p < points.length; p++) {
+                var px = points[p][0];
+                var py = points[p][1];
+                try {
+                    t.dispatchEvent(new MouseEvent(p === 0 ? "mouseenter" : "mousemove", { bubbles: true, cancelable: true, view: window, clientX: px, clientY: py }));
+                    t.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window, clientX: px, clientY: py }));
+                } catch (e) {}
+                try {
+                    if (typeof PointerEvent !== "undefined") {
+                        t.dispatchEvent(new PointerEvent(p === 0 ? "pointerenter" : "pointermove", { bubbles: true, cancelable: true, view: window, clientX: px, clientY: py, pointerType: "mouse", isPrimary: true }));
+                        t.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, cancelable: true, view: window, clientX: px, clientY: py, pointerType: "mouse", isPrimary: true }));
+                    }
+                } catch (e2) {}
+            }
         }
         try {
             if (window.__cinejoyNative && window.__cinejoyNative.pulseMouseHover) {
                 window.__cinejoyNative.pulseMouseHover();
             }
         } catch (e3) {}
+    }
+
+    function wakePlayerHud() {
+        var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root") || document.body;
+        if (!root) {
+            return;
+        }
+        dispatchPointerSweep(root);
+        if (state.hudRetryWakeTimer) {
+            clearTimeout(state.hudRetryWakeTimer);
+            state.hudRetryWakeTimer = null;
+        }
+        if (isWatchRoute()) {
+            state.hudRetryWakeTimer = setTimeout(function() {
+                state.hudRetryWakeTimer = null;
+                var currentRoot = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root");
+                if (isWatchRoute() && currentRoot && ((currentRoot.classList && currentRoot.classList.contains("cursor-none")) || currentRoot.querySelectorAll("button").length === 0)) {
+                    dispatchPointerSweep(currentRoot);
+                }
+            }, 80);
+        }
     }
 
     function isInFullscreen() {
@@ -582,7 +599,15 @@ object SpatialNavigationEngine {
     }
 
     function findNativeSeekControl() {
-        return document.querySelector('input[aria-label="Seek Video"], input[type="range"], [data-cj-seekbar="1"], [role="slider"]');
+        var existing = document.querySelector('[data-cj-seekbar="1"]');
+        if (existing) {
+            return existing;
+        }
+        var seekInput = document.querySelector('input[aria-label="Seek Video"], input[type="range"]');
+        if (seekInput && seekInput.parentElement) {
+            return seekInput.parentElement;
+        }
+        return document.querySelector('[role="slider"]');
     }
 
     function findNativePlayPauseButton() {
@@ -592,35 +617,26 @@ object SpatialNavigationEngine {
     function dispatchNativeDirectionalSeek(isRight) {
         var keyName = isRight ? "ArrowRight" : "ArrowLeft";
         var keyCodeNum = isRight ? 39 : 37;
-        var vid = findActiveVideo();
-        var seekEl = findNativeSeekControl();
-        var playerRoot = getPlayerRoot(vid);
-        var targets = [];
-        if (seekEl) { targets.push(seekEl); }
-        if (playerRoot) { targets.push(playerRoot); }
-        targets.push(document);
-        for (var i = 0; i < targets.length; i++) {
-            try {
-                var kd = new KeyboardEvent("keydown", {
-                    key: keyName,
-                    code: keyName,
-                    keyCode: keyCodeNum,
-                    which: keyCodeNum,
-                    bubbles: true,
-                    cancelable: true
-                });
-                targets[i].dispatchEvent(kd);
-                var ku = new KeyboardEvent("keyup", {
-                    key: keyName,
-                    code: keyName,
-                    keyCode: keyCodeNum,
-                    which: keyCodeNum,
-                    bubbles: true,
-                    cancelable: true
-                });
-                targets[i].dispatchEvent(ku);
-            } catch (e) {}
-        }
+        try {
+            var kd = new KeyboardEvent("keydown", {
+                key: keyName,
+                code: keyName,
+                keyCode: keyCodeNum,
+                which: keyCodeNum,
+                bubbles: true,
+                cancelable: true
+            });
+            document.dispatchEvent(kd);
+            var ku = new KeyboardEvent("keyup", {
+                key: keyName,
+                code: keyName,
+                keyCode: keyCodeNum,
+                which: keyCodeNum,
+                bubbles: true,
+                cancelable: true
+            });
+            document.dispatchEvent(ku);
+        } catch (e) {}
     }
 
     function getPlayerRoot(vid) {
@@ -753,6 +769,10 @@ object SpatialNavigationEngine {
 
     function resetHudAutoHide() {
         clearHudAutoHideTimer();
+        if (state.hudRetryWakeTimer) {
+            clearTimeout(state.hudRetryWakeTimer);
+            state.hudRetryWakeTimer = null;
+        }
         state.hudHidden = false;
         state.lastHudElement = null;
         document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
@@ -829,7 +849,10 @@ object SpatialNavigationEngine {
             return false;
         }
         var playerRoot = getPlayerRoot(findActiveVideo());
-        var nodes = document.querySelectorAll('input[aria-label="Seek Video"], input[type="range"], [data-cj-seekbar="1"], button[aria-label="Pause"], button[aria-label="Play"], button[aria-label*="Fullscreen"], button[aria-label*="fullscreen"]');
+        if (playerRoot && playerRoot.classList && playerRoot.classList.contains("cursor-none")) {
+            return false;
+        }
+        var nodes = document.querySelectorAll('[data-cj-seekbar="1"], button[aria-label="Pause"], button[aria-label="Play"], button[aria-label*="Fullscreen"], button[aria-label*="fullscreen"]');
         for (var i = 0; i < nodes.length; i++) {
             var el = nodes[i];
             if (!el.getBoundingClientRect) {
@@ -897,9 +920,13 @@ object SpatialNavigationEngine {
         reportSurfaceTransparency(onWatch);
         if (onWatch) {
             document.documentElement.classList.add(WATCH_CLASS);
-            var seekBar = findNativeSeekControl();
-            if (seekBar && seekBar.getAttribute("data-cj-seekbar") !== "1") {
-                seekBar.setAttribute("data-cj-seekbar", "1");
+            var seekInput = document.querySelector('input[aria-label="Seek Video"], input[type="range"]');
+            var seekWrapper = (seekInput && seekInput.parentElement) ? seekInput.parentElement : document.querySelector('[role="slider"]');
+            if (seekWrapper && seekWrapper.getAttribute("data-cj-seekbar") !== "1") {
+                seekWrapper.setAttribute("role", "slider");
+                seekWrapper.setAttribute("tabindex", "0");
+                seekWrapper.setAttribute("aria-label", "Timeline Seek Bar");
+                seekWrapper.setAttribute("data-cj-seekbar", "1");
                 state.cacheTime = 0;
             }
             var videos = document.querySelectorAll("video");
@@ -985,7 +1012,7 @@ object SpatialNavigationEngine {
             " transform: none !important;" +
             " z-index: 9999 !important;" +
             " }" +
-            "[data-cj-seekbar=\"1\"]." + FOCUS_CLASS + ", input[type=\"range\"]." + FOCUS_CLASS + " {" +
+            "[data-cj-seekbar=\"1\"]." + FOCUS_CLASS + " {" +
             " background-color: rgba(255, 255, 0, 0.22) !important;" +
             " border-radius: 8px !important;" +
             " }" +
@@ -1124,6 +1151,9 @@ object SpatialNavigationEngine {
         if (el.disabled || el.getAttribute("aria-disabled") === "true" || el.getAttribute("aria-hidden") === "true") {
             return false;
         }
+        if (el.tagName === "INPUT" && el.type === "range") {
+            return false;
+        }
         var tabIdx = el.getAttribute("tabindex");
         if (tabIdx === "-1" && !matchesSelector(el, "a[href], button, input, select, textarea")) {
             return false;
@@ -1137,7 +1167,7 @@ object SpatialNavigationEngine {
             return false;
         }
         if (el.tagName === "DIV") {
-            if (rect.width > vw * 0.70 && rect.height > vh * 0.50) {
+            if (rect.width > vw * 0.70 && rect.height > vh * 0.50 && !isSeekControlElement(el)) {
                 return false;
             }
             var divTxt = (el.innerText || "").replace(/\s+/g, "").trim();
@@ -1176,6 +1206,7 @@ object SpatialNavigationEngine {
         if (rawList.length <= 1) {
             return rawList;
         }
+        var skip = {};
         var hrefBest = {};
         for (var i = 0; i < rawList.length; i++) {
             var item = rawList[i];
@@ -1203,7 +1234,6 @@ object SpatialNavigationEngine {
             }
         }
 
-        var skip = {};
         for (var k in hrefBest) {
             var group = hrefBest[k];
             if (group.length < 2) {
@@ -1239,6 +1269,27 @@ object SpatialNavigationEngine {
                             skip[ca.idx] = true;
                             break;
                         }
+                    }
+                }
+            }
+        }
+
+        for (var bi = 0; bi < rawList.length; bi++) {
+            var outer = rawList[bi].el;
+            if (skip[bi] || outer.tagName !== "BUTTON") {
+                continue;
+            }
+            var outerAria = outer.getAttribute("aria-label") || "";
+            for (var bj = 0; bj < rawList.length; bj++) {
+                if (bi === bj || skip[bj] || rawList[bj].el.tagName !== "BUTTON") {
+                    continue;
+                }
+                var inner = rawList[bj].el;
+                if (outer.contains(inner) && outer !== inner) {
+                    var innerAria = inner.getAttribute("aria-label") || "";
+                    if (outerAria && outerAria === innerAria) {
+                        skip[bi] = true;
+                        break;
                     }
                 }
             }
@@ -1631,10 +1682,10 @@ object SpatialNavigationEngine {
         }
     }
 
-    function dispatchPointerEvent(el, type, cx, cy) {
+    function dispatchPointerEvent(el, type, cx, cy, shouldBubble) {
         try {
             var evt = new MouseEvent(type, {
-                bubbles: true,
+                bubbles: shouldBubble !== false,
                 cancelable: true,
                 view: window,
                 clientX: cx,
@@ -1751,19 +1802,32 @@ object SpatialNavigationEngine {
             return "tap:" + prepareTapCoords(el);
         }
 
+        var hasParentButton = !!(el.parentElement && el.parentElement.closest && el.parentElement.closest("button"));
         var rect = el.getBoundingClientRect();
         var cx = rect.left + rect.width * 0.5;
         var cy = rect.top + rect.height * 0.5;
 
-        dispatchPointerEvent(el, "pointerdown", cx, cy);
-        dispatchPointerEvent(el, "mousedown", cx, cy);
-        dispatchPointerEvent(el, "pointerup", cx, cy);
-        dispatchPointerEvent(el, "mouseup", cx, cy);
+        dispatchPointerEvent(el, "pointerdown", cx, cy, !hasParentButton);
+        dispatchPointerEvent(el, "mousedown", cx, cy, !hasParentButton);
+        dispatchPointerEvent(el, "pointerup", cx, cy, !hasParentButton);
+        dispatchPointerEvent(el, "mouseup", cx, cy, !hasParentButton);
 
         if (typeof el.click === "function") {
-            el.click();
+            if (hasParentButton) {
+                var stopNestedClick = function(ev) {
+                    ev.stopPropagation();
+                };
+                el.addEventListener("click", stopNestedClick, false);
+                try {
+                    el.click();
+                } finally {
+                    el.removeEventListener("click", stopNestedClick, false);
+                }
+            } else {
+                el.click();
+            }
         } else {
-            dispatchPointerEvent(el, "click", cx, cy);
+            dispatchPointerEvent(el, "click", cx, cy, !hasParentButton);
         }
 
         setTimeout(function() {
@@ -2198,6 +2262,8 @@ object SpatialNavigationEngine {
     var STYLE_ATTR = "data-cinejoy-mobile-hud";
     var HUD_AUTO_HIDE_MS = 3000;
     var hudTimer = null;
+    var refreshTimer = null;
+    var watchGuardTimer = null;
     var boundVid = null;
     var lastReportedWatch = null;
 
@@ -2276,6 +2342,17 @@ object SpatialNavigationEngine {
         return false;
     }
 
+    function hasMountedPlayerControls() {
+        var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root");
+        if (!root) {
+            return false;
+        }
+        if (root.classList && root.classList.contains("cursor-none")) {
+            return false;
+        }
+        return root.querySelectorAll("button").length > 0;
+    }
+
     function markHudChrome() {
         var vid = document.querySelector("video");
         var root = document.fullscreenElement || document.webkitFullscreenElement || document.querySelector(".player-root") || (vid ? vid.parentElement : null);
@@ -2331,15 +2408,24 @@ object SpatialNavigationEngine {
         hudTimer = setTimeout(hideHud, HUD_AUTO_HIDE_MS);
     }
 
-    function wakeHud() {
-        document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
-        scheduleHide();
+    function syncWatchGuardTimer(onWatch) {
+        if (onWatch && !watchGuardTimer) {
+            watchGuardTimer = setInterval(function() {
+                if (isWatchRoute()) {
+                    refresh();
+                }
+            }, 3000);
+        } else if (!onWatch && watchGuardTimer) {
+            clearInterval(watchGuardTimer);
+            watchGuardTimer = null;
+        }
     }
 
     function refresh() {
         injectMobileStyles();
         var onWatch = isWatchRoute();
         reportTransparency(onWatch);
+        syncWatchGuardTimer(onWatch);
         if (onWatch) {
             document.documentElement.classList.add(WATCH_CLASS);
             markHudChrome();
@@ -2371,9 +2457,54 @@ object SpatialNavigationEngine {
         }
     }
 
-    document.addEventListener("touchstart", wakeHud, { passive: true, capture: true });
-    document.addEventListener("pointerdown", wakeHud, { passive: true, capture: true });
-    document.addEventListener("click", wakeHud, true);
+    function scheduleDebouncedRefresh() {
+        if (refreshTimer) {
+            clearTimeout(refreshTimer);
+        }
+        refreshTimer = setTimeout(refresh, 160);
+    }
+
+    document.addEventListener("click", function(e) {
+        if (!isWatchRoute()) {
+            return;
+        }
+        if (document.documentElement.classList.contains(HUD_HIDDEN_CLASS)) {
+            var mounted = hasMountedPlayerControls();
+            document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
+            scheduleHide();
+            if (mounted) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+            return;
+        }
+        scheduleHide();
+    }, true);
+
+    if (window.history) {
+        var origPushState = window.history.pushState;
+        if (typeof origPushState === "function") {
+            window.history.pushState = function() {
+                var ret = origPushState.apply(this, arguments);
+                scheduleDebouncedRefresh();
+                return ret;
+            };
+        }
+        var origReplaceState = window.history.replaceState;
+        if (typeof origReplaceState === "function") {
+            window.history.replaceState = function() {
+                var ret = origReplaceState.apply(this, arguments);
+                scheduleDebouncedRefresh();
+                return ret;
+            };
+        }
+    }
+    window.addEventListener("popstate", scheduleDebouncedRefresh);
+
+    if (typeof MutationObserver !== "undefined" && document.body) {
+        var observer = new MutationObserver(scheduleDebouncedRefresh);
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
 
     window.__cinejoyMobileHud = {
         initialized: true,
@@ -2381,7 +2512,6 @@ object SpatialNavigationEngine {
     };
 
     refresh();
-    setInterval(refresh, 2000);
 })();
 """
 

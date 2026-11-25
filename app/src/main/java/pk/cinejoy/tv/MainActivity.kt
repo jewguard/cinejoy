@@ -147,15 +147,20 @@ class MainActivity : AppCompatActivity() {
                         val enterEvent = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_ENTER, hx, hy, 0).apply {
                             source = InputDevice.SOURCE_MOUSE
                         }
-                        val hoverEvent = MotionEvent.obtain(now, now + 4L, MotionEvent.ACTION_HOVER_MOVE, hx, hy, 0).apply {
+                        val hoverEvent1 = MotionEvent.obtain(now, now + 4L, MotionEvent.ACTION_HOVER_MOVE, hx, hy, 0).apply {
+                            source = InputDevice.SOURCE_MOUSE
+                        }
+                        val hoverEvent2 = MotionEvent.obtain(now, now + 10L, MotionEvent.ACTION_HOVER_MOVE, hx + 24f, hy + 12f, 0).apply {
                             source = InputDevice.SOURCE_MOUSE
                         }
                         try {
                             target.dispatchGenericMotionEvent(enterEvent)
-                            target.dispatchGenericMotionEvent(hoverEvent)
+                            target.dispatchGenericMotionEvent(hoverEvent1)
+                            target.dispatchGenericMotionEvent(hoverEvent2)
                         } finally {
                             enterEvent.recycle()
-                            hoverEvent.recycle()
+                            hoverEvent1.recycle()
+                            hoverEvent2.recycle()
                         }
                     }
                 }
@@ -208,11 +213,11 @@ class MainActivity : AppCompatActivity() {
                         ActivityInfo.SCREEN_ORIENTATION_FULL_USER
                     }
                 }
+                updateSystemUiForRoute(isWatchOrFullscreenActive())
             }
         )
         lifecycle.addObserver(exoPlayerController)
 
-        enterFullscreenImmersiveMode()
         attachWebViewComponents(cinejoyWebView)
 
         if (BuildConfig.IS_TV_PLATFORM) {
@@ -220,6 +225,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val initialUrl = CineJoyApplication.consumeRecoveryUrl(this)
+        updateSystemUiForRoute(initialUrl.contains("/watch/"))
         cinejoyWebView.loadUrl(initialUrl)
     }
 
@@ -235,7 +241,7 @@ class MainActivity : AppCompatActivity() {
                 if (!BuildConfig.IS_TV_PLATFORM) {
                     requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 }
-                enterFullscreenImmersiveMode()
+                updateSystemUiForRoute(true)
                 SpatialNavigationEngine.onFullscreenChanged(targetWebView, true)
             },
             onExitFullscreen = {
@@ -244,7 +250,7 @@ class MainActivity : AppCompatActivity() {
                 if (!BuildConfig.IS_TV_PLATFORM && !exoPlayerController.isVisible()) {
                     requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
                 }
-                enterFullscreenImmersiveMode()
+                updateSystemUiForRoute(isWatchOrFullscreenActive())
                 SpatialNavigationEngine.onFullscreenChanged(targetWebView, false)
             }
         )
@@ -378,6 +384,7 @@ class MainActivity : AppCompatActivity() {
                         rootContainer.setBackgroundColor(opaqueDark)
                         cinejoyWebView.setBackgroundColor(opaqueDark)
                     }
+                    updateSystemUiForRoute(isWatchOrFullscreenActive())
                 }
             }
         }
@@ -391,7 +398,7 @@ class MainActivity : AppCompatActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
-            enterFullscreenImmersiveMode()
+            updateSystemUiForRoute(isWatchOrFullscreenActive())
         }
     }
 
@@ -491,7 +498,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         if (!isInPictureInPictureMode && !isWebViewDestroyed) {
-            enterFullscreenImmersiveMode()
+            updateSystemUiForRoute(isWatchOrFullscreenActive())
         }
     }
 
@@ -605,6 +612,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun isWatchOrFullscreenActive(): Boolean {
+        return isWatchSurfaceTransparent ||
+            (::fullscreenChromeClient.isInitialized && fullscreenChromeClient.isFullscreenActive()) ||
+            (::exoPlayerController.isInitialized && exoPlayerController.isVisible()) ||
+            (::cinejoyWebView.isInitialized && cinejoyWebView.url?.contains("/watch/") == true)
+    }
+
+    private fun updateSystemUiForRoute(isWatchOrFullscreen: Boolean) {
+        if (BuildConfig.IS_TV_PLATFORM || isWatchOrFullscreen) {
+            enterFullscreenImmersiveMode()
+            return
+        }
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        val controller = WindowInsetsControllerCompat(window, rootContainer)
+        controller.isAppearanceLightStatusBars = false
+        controller.isAppearanceLightNavigationBars = false
+        controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+
     private fun enterFullscreenImmersiveMode() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -636,7 +663,7 @@ class MainActivity : AppCompatActivity() {
         if (!isWebViewDestroyed) {
             cinejoyWebView.resumeTimers()
             cinejoyWebView.onResume()
-            enterFullscreenImmersiveMode()
+            updateSystemUiForRoute(isWatchOrFullscreenActive())
         }
     }
 

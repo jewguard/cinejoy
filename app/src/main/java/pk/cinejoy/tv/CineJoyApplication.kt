@@ -68,10 +68,7 @@ class CineJoyApplication : Application() {
                     Looper.loop()
                     return@post
                 } catch (_: Throwable) {
-                    if (!shouldRelaunchNow()) {
-                        continue
-                    }
-                    relaunchMainActivity()
+                    recoverSilently()
                 }
             }
         }
