@@ -32,19 +32,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Decode release keystore
-        env:
-          CINEJOY_KEYSTORE_BASE64: ${{ secrets.CINEJOY_KEYSTORE_BASE64 }}
-        run: |
-          printf '%s' "$CINEJOY_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "${RUNNER_TEMP}/cinejoy-release.jks"
-          test -s "${RUNNER_TEMP}/cinejoy-release.jks"
-
-      - name: Build signed Android and Fire OS APKs
-        env:
-          CINEJOY_KEYSTORE_PATH: ${{ runner.temp }}/cinejoy-release.jks
-          CINEJOY_KEYSTORE_PASSWORD: ${{ secrets.CINEJOY_KEYSTORE_PASSWORD }}
-          CINEJOY_KEY_ALIAS: ${{ secrets.CINEJOY_KEY_ALIAS }}
-          CINEJOY_KEY_PASSWORD: ${{ secrets.CINEJOY_KEY_PASSWORD }}
+      - name: Build Android and Fire OS release APKs
         run: sh ./gradlew --no-daemon assembleFirestickRelease assembleAndroidRelease lintVitalFirestickRelease lintVitalAndroidRelease
 
       - name: Package and verify signed APKs

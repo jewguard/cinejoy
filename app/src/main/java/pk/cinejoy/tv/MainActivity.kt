@@ -18,6 +18,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
@@ -65,15 +66,6 @@ class MainActivity : AppCompatActivity() {
     private inner class CineJoyNativeBridge {
         @JavascriptInterface
         fun releaseVideoOverlay() {
-            Thread {
-                Runtime.getRuntime().gc()
-                try {
-                    Thread.sleep(120L)
-                } catch (_: InterruptedException) {
-                    return@Thread
-                }
-                Runtime.getRuntime().gc()
-            }.start()
         }
 
         @JavascriptInterface
@@ -457,9 +449,12 @@ class MainActivity : AppCompatActivity() {
             settings.offscreenPreRaster = false
         }
 
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.setAcceptCookie(true)
-        cookieManager.setAcceptThirdPartyCookies(targetWebView, true)
+        try {
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(targetWebView, true)
+        } catch (_: Throwable) {
+        }
 
         targetWebView.addJavascriptInterface(CineJoyNativeBridge(), NATIVE_BRIDGE_NAME)
         targetWebView.setLayerType(View.LAYER_TYPE_NONE, null)
@@ -587,7 +582,10 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_ENTER,
             KeyEvent.KEYCODE_NUMPAD_ENTER -> SpatialNavigationEngine.activateFocusedElement(
                 cinejoyWebView,
-                fullscreenChromeClient.getActiveCustomView()
+                fullscreenChromeClient.getActiveCustomView(),
+                isEnterKey = (keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER),
+                onShowIme = { showSoftKeyboard(cinejoyWebView) },
+                onHideIme = { hideSoftKeyboard(cinejoyWebView) }
             ) { fullscreenChromeClient.isFullscreenActive() }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
             KeyEvent.KEYCODE_MEDIA_PLAY,
@@ -596,11 +594,17 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_MEDIA_REWIND -> SpatialNavigationEngine.seekVideo(cinejoyWebView, -10)
             KeyEvent.KEYCODE_BACK -> {
                 if (fullscreenChromeClient.isFullscreenActive()) {
-                    SpatialNavigationEngine.handleBackKey(cinejoyWebView) {
+                    SpatialNavigationEngine.handleBackKey(
+                        cinejoyWebView,
+                        onBlurIme = { hideSoftKeyboard(cinejoyWebView) }
+                    ) {
                         fullscreenChromeClient.onHideCustomView()
                     }
                 } else {
-                    SpatialNavigationEngine.handleBackKey(cinejoyWebView) {
+                    SpatialNavigationEngine.handleBackKey(
+                        cinejoyWebView,
+                        onBlurIme = { hideSoftKeyboard(cinejoyWebView) }
+                    ) {
                         if (cinejoyWebView.canGoBack()) {
                             SpatialNavigationEngine.navigateBackCleanly(cinejoyWebView)
                         } else {
@@ -641,11 +645,21 @@ class MainActivity : AppCompatActivity() {
         controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
-    private fun exitFullscreenImmersiveMode() {
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowCompat.setDecorFitsSystemWindows(window, true)
-        val controller = WindowInsetsControllerCompat(window, rootContainer)
-        controller.show(WindowInsetsCompat.Type.systemBars())
+    private fun showSoftKeyboard(targetView: View) {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        targetView.requestFocus()
+        imm.showSoftInput(targetView, InputMethodManager.SHOW_IMPLICIT)
+        targetView.postDelayed({
+            if (!isWebViewDestroyed && targetView.isAttachedToWindow) {
+                targetView.requestFocus()
+                imm.showSoftInput(targetView, InputMethodManager.SHOW_IMPLICIT)
+            }
+        }, 120L)
+    }
+
+    private fun hideSoftKeyboard(targetView: View) {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        imm.hideSoftInputFromWindow(targetView.windowToken, 0)
     }
 
     override fun onStart() {
@@ -696,7 +710,7 @@ class MainActivity : AppCompatActivity() {
         if (::exoPlayerController.isInitialized) {
             exoPlayerController.closePlayer()
         }
-        exitFullscreenImmersiveMode()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (::cinejoyWebView.isInitialized && !isWebViewDestroyed) {
             isWebViewDestroyed = true
             cinejoyWebView.removeJavascriptInterface(NATIVE_BRIDGE_NAME)

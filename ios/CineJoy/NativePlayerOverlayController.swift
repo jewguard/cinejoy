@@ -21,7 +21,7 @@ final class NativePlayerOverlayController: NSObject, AVPlayerViewControllerDeleg
     private var controlsHideTimer: Timer?
     private var retryWorkItem: DispatchWorkItem?
     private var retryAttempt = 0
-    private let maxRetries = 4
+    private let maxRetries = 3
     private var activeURLString: String?
     private var activeHeaders: [String: String] = [:]
     private var savedPositionSeconds: Double = 0
@@ -183,7 +183,12 @@ final class NativePlayerOverlayController: NSObject, AVPlayerViewControllerDeleg
                     }
                     avPlayer.play()
                 case .failed:
-                    self.schedulePlaybackRetry()
+                    if let nsErr = item.error as NSError?,
+                       (nsErr.code == NSURLErrorFileDoesNotExist || nsErr.code == NSURLErrorNoPermissionsToReadFile || nsErr.code == NSURLErrorBadServerResponse) {
+                        self.close()
+                    } else {
+                        self.schedulePlaybackRetry()
+                    }
                 default:
                     break
                 }

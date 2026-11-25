@@ -94,12 +94,26 @@ object AdBlockerFilter {
         return normalized == "cinejoy.pk" || normalized.endsWith(".cinejoy.pk")
     }
 
+    fun isAllowedServiceHost(host: String?): Boolean {
+        if (host.isNullOrBlank()) {
+            return false
+        }
+        val normalized = host.lowercase(Locale.US)
+        return isCineJoyHost(normalized) ||
+            normalized == "server2.wing.st" ||
+            normalized == "lists2.wing.st" ||
+            normalized == "challenges.cloudflare.com" ||
+            normalized.endsWith(".challenges.cloudflare.com") ||
+            normalized == "tmdb.org" ||
+            normalized.endsWith(".tmdb.org")
+    }
+
     fun isBlocked(uri: Uri?): Boolean {
         if (uri == null) {
             return false
         }
         val host = uri.host?.lowercase(Locale.US) ?: return false
-        if (isCineJoyHost(host) || host == "tmdb.org" || host.endsWith(".tmdb.org")) {
+        if (isAllowedServiceHost(host)) {
             return false
         }
         val path = uri.path?.lowercase(Locale.US) ?: ""

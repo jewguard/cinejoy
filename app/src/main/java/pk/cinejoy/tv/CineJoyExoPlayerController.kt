@@ -32,7 +32,7 @@ class CineJoyExoPlayerController(
 
     companion object {
         private const val CONTROLLER_TIMEOUT_MS = 3000
-        private const val MAX_PLAYBACK_RETRIES = 4
+        private const val MAX_PLAYBACK_RETRIES = 3
         private const val SEEK_INCREMENT_MS = 10_000L
     }
 
@@ -59,6 +59,16 @@ class CineJoyExoPlayerController(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            when (error.errorCode) {
+                PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+                PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+                PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+                PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED,
+                PlaybackException.ERROR_CODE_DECODER_INIT_FAILED -> {
+                    closePlayer()
+                    return
+                }
+            }
             val url = activeUrl ?: run {
                 closePlayer()
                 return

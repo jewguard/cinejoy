@@ -90,11 +90,25 @@ enum AdBlockerRules {
         return normalized == "cinejoy.pk" || normalized.hasSuffix(".cinejoy.pk")
     }
 
+    static func isAllowedServiceHost(_ host: String?) -> Bool {
+        guard let host = host, !host.isEmpty else {
+            return false
+        }
+        let normalized = host.lowercased()
+        return isCineJoyHost(normalized) ||
+            normalized == "server2.wing.st" ||
+            normalized == "lists2.wing.st" ||
+            normalized == "challenges.cloudflare.com" ||
+            normalized.hasSuffix(".challenges.cloudflare.com") ||
+            normalized == "tmdb.org" ||
+            normalized.hasSuffix(".tmdb.org")
+    }
+
     static func isBlocked(_ url: URL?) -> Bool {
         guard let url = url, let host = url.host?.lowercased() else {
             return false
         }
-        if isCineJoyHost(host) || host == "tmdb.org" || host.hasSuffix(".tmdb.org") {
+        if isAllowedServiceHost(host) {
             return false
         }
         let path = url.path.lowercased()
@@ -113,12 +127,13 @@ enum AdBlockerRules {
 
     static func compileContentRuleList(completion: @escaping (WKContentRuleList?) -> Void) {
         var rules: [[String: Any]] = []
+        let allowDomains = ["*cinejoy.pk", "*tmdb.org", "server2.wing.st", "lists2.wing.st", "challenges.cloudflare.com", "*challenges.cloudflare.com"]
         for domain in blockedHosts.sorted() {
             let escaped = NSRegularExpression.escapedPattern(for: domain)
             let rule: [String: Any] = [
                 "trigger": [
                     "url-filter": "^https?://([^/]+\\.)?" + escaped + "(/|$)",
-                    "unless-domain": ["*cinejoy.pk", "*tmdb.org"]
+                    "unless-domain": allowDomains
                 ],
                 "action": [
                     "type": "block"
@@ -131,7 +146,7 @@ enum AdBlockerRules {
             let rule: [String: Any] = [
                 "trigger": [
                     "url-filter": escaped,
-                    "unless-domain": ["*cinejoy.pk", "*tmdb.org"]
+                    "unless-domain": allowDomains
                 ],
                 "action": [
                     "type": "block"
@@ -147,7 +162,7 @@ enum AdBlockerRules {
             return
         }
         WKContentRuleListStore.default().compileContentRuleList(
-            forIdentifier: "cinejoy-adblock-rules-v1",
+            forIdentifier: "cinejoy-adblock-rules-v2",
             encodedContentRuleList: jsonString
         ) { list, _ in
             DispatchQueue.main.async {

@@ -42,6 +42,7 @@ class CineJoyWebViewClient(
         return handleNavigation(request?.url, request?.isForMainFrame ?: true)
     }
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
         if (url.isNullOrBlank()) {
             return true
@@ -105,6 +106,7 @@ class CineJoyWebViewClient(
         }
     }
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onReceivedError(
         view: WebView?,
         errorCode: Int,

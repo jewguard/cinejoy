@@ -246,6 +246,10 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping () -> Void
     ) {
+        guard presentedViewController == nil else {
+            completionHandler()
+            return
+        }
         let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
             completionHandler()
@@ -259,6 +263,10 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping (Bool) -> Void
     ) {
+        guard presentedViewController == nil else {
+            completionHandler(false)
+            return
+        }
         let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
             completionHandler(false)
@@ -276,6 +284,10 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping (String?) -> Void
     ) {
+        guard presentedViewController == nil else {
+            completionHandler(nil)
+            return
+        }
         let alert = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
         alert.addTextField { field in
             field.text = defaultText
@@ -368,13 +380,14 @@ final class CineJoyViewController: UIViewController, WKNavigationDelegate, WKUID
             statusLbl.font = .systemFont(ofSize: 13)
             errorStatusLabel = statusLbl
 
-            let retryBtn = UIButton(type: .system)
-            retryBtn.setTitle("Retry Now", for: .normal)
-            retryBtn.setTitleColor(backgroundDark, for: .normal)
-            retryBtn.backgroundColor = .systemYellow
+            var retryConfig = UIButton.Configuration.filled()
+            retryConfig.title = "Retry Now"
+            retryConfig.baseBackgroundColor = .systemYellow
+            retryConfig.baseForegroundColor = backgroundDark
+            retryConfig.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 28, bottom: 12, trailing: 28)
+            retryConfig.cornerStyle = .medium
+            let retryBtn = UIButton(configuration: retryConfig)
             retryBtn.titleLabel?.font = .systemFont(ofSize: 16, weight: .bold)
-            retryBtn.layer.cornerRadius = 8
-            retryBtn.contentEdgeInsets = UIEdgeInsets(top: 12, left: 28, bottom: 12, right: 28)
             retryBtn.addTarget(self, action: #selector(handleManualRetry), for: .touchUpInside)
 
             stack.addArrangedSubview(titleLbl)

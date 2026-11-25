@@ -5,9 +5,6 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val releaseKeystorePath: String? = System.getenv("CINEJOY_KEYSTORE_PATH")
-val hasReleaseKeystore = !releaseKeystorePath.isNullOrBlank() && file(releaseKeystorePath).exists()
-
 android {
     namespace = "pk.cinejoy.tv"
     compileSdk = 35
@@ -38,17 +35,6 @@ android {
         }
     }
 
-    signingConfigs {
-        create("release") {
-            if (hasReleaseKeystore) {
-                storeFile = file(releaseKeystorePath!!)
-                storePassword = System.getenv("CINEJOY_KEYSTORE_PASSWORD") ?: ""
-                keyAlias = System.getenv("CINEJOY_KEY_ALIAS") ?: ""
-                keyPassword = System.getenv("CINEJOY_KEY_PASSWORD") ?: ""
-            }
-        }
-    }
-
     buildTypes {
         debug {
             isDebuggable = true
@@ -63,9 +49,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            if (hasReleaseKeystore) {
-                signingConfig = signingConfigs.getByName("release")
-            }
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -78,7 +62,6 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
-        freeCompilerArgs.add("-opt-in=androidx.media3.common.util.UnstableApi")
     }
 }
 

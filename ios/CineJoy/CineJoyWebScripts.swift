@@ -18,13 +18,24 @@ enum CineJoyWebScripts {
         return false;
     }
 
-    function isRetryableStatus(status) {
+    function isLoginAuthUrl(url) {
+        if (!url) {
+            return false;
+        }
+        return String(url).toLowerCase().indexOf("/api/auth/login") !== -1;
+    }
+
+    function isTransientRetryStatus(status) {
         return status === 408 || status === 429 || (status >= 500 && status <= 599);
     }
 
+    function isGatewayRetryStatus(status) {
+        return status === 502 || status === 503 || status === 504;
+    }
+
     function computeBackoffDelay(attempt) {
-        var base = Math.min(350 * Math.pow(2, attempt), 5600);
-        return base + Math.floor(Math.random() * 120);
+        var base = Math.min(350 * Math.pow(2, attempt), 1400);
+        return base + Math.floor(Math.random() * 100);
     }
 
     if (!window.__cinejoyNetInstalled) {
@@ -35,10 +46,12 @@ enum CineJoyWebScripts {
             window.fetch = function(input, init) {
                 var url = (typeof input === "string") ? input : (input && input.url ? input.url : "");
                 var method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
-                if (!isMediaRetryUrl(url) || (method !== "GET" && method !== "HEAD")) {
+                var mediaRetry = isMediaRetryUrl(url) && (method === "GET" || method === "HEAD");
+                var authLoginRetry = isLoginAuthUrl(url) && method === "POST";
+                if (!mediaRetry && !authLoginRetry) {
                     return origFetch(input, init);
                 }
-                var maxRetries = 5;
+                var maxRetries = mediaRetry ? 3 : 1;
                 var signal = (init && init.signal) ? init.signal : (input && input.signal ? input.signal : null);
 
                 function execAttempt(attempt) {
@@ -46,9 +59,10 @@ enum CineJoyWebScripts {
                         return origFetch(input, init);
                     }
                     return origFetch(input, init).then(function(response) {
-                        if (isRetryableStatus(response.status) && attempt < maxRetries) {
+                        var shouldRetry = mediaRetry ? isTransientRetryStatus(response.status) : isGatewayRetryStatus(response.status);
+                        if (shouldRetry && attempt < maxRetries) {
                             return new Promise(function(resolve, reject) {
-                                var delay = computeBackoffDelay(attempt);
+                                var delay = mediaRetry ? computeBackoffDelay(attempt) : 800;
                                 setTimeout(function() {
                                     execAttempt(attempt + 1).then(resolve, reject);
                                 }, delay);
@@ -56,7 +70,7 @@ enum CineJoyWebScripts {
                         }
                         return response;
                     }, function(err) {
-                        if ((signal && signal.aborted) || attempt >= maxRetries) {
+                        if ((signal && signal.aborted) || attempt >= maxRetries || !mediaRetry) {
                             throw err;
                         }
                         return new Promise(function(resolve, reject) {
@@ -121,7 +135,7 @@ enum CineJoyWebScripts {
                 }
 
                 function scheduleRetry(fallbackEventType, evt) {
-                    if (aborted || !shouldRetryRequest() || attempt >= 5) {
+                    if (aborted || !shouldRetryRequest() || attempt >= 3) {
                         emitEvent("readystatechange", evt);
                         emitEvent(fallbackEventType, evt);
                         if (fallbackEventType !== "loadend") {
@@ -159,7 +173,7 @@ enum CineJoyWebScripts {
                     var retryPending = false;
                     target.onreadystatechange = function(evt) {
                         if (aborted) { return; }
-                        if (target.readyState === 4 && shouldRetryRequest() && isRetryableStatus(target.status) && attempt < 5) {
+                        if (target.readyState === 4 && shouldRetryRequest() && isTransientRetryStatus(target.status) && attempt < 3) {
                             retryPending = true;
                             return;
                         }
@@ -169,7 +183,7 @@ enum CineJoyWebScripts {
                     };
                     target.onload = function(evt) {
                         if (aborted) { return; }
-                        if (shouldRetryRequest() && isRetryableStatus(target.status) && attempt < 5) {
+                        if (shouldRetryRequest() && isTransientRetryStatus(target.status) && attempt < 3) {
                             retryPending = true;
                             scheduleRetry("load", evt);
                             return;
@@ -178,7 +192,7 @@ enum CineJoyWebScripts {
                     };
                     target.onerror = function(evt) {
                         if (aborted) { return; }
-                        if (shouldRetryRequest() && attempt < 5) {
+                        if (shouldRetryRequest() && attempt < 3) {
                             retryPending = true;
                             scheduleRetry("error", evt);
                             return;
@@ -187,7 +201,7 @@ enum CineJoyWebScripts {
                     };
                     target.ontimeout = function(evt) {
                         if (aborted) { return; }
-                        if (shouldRetryRequest() && attempt < 5) {
+                        if (shouldRetryRequest() && attempt < 3) {
                             retryPending = true;
                             scheduleRetry("timeout", evt);
                             return;
@@ -409,7 +423,7 @@ enum CineJoyWebScripts {
     }
 
     function injectSafeAreaAndHudStyles() {
-        if (document.querySelector("style[" + STYLE_ATTR + "=\"true\"]")) {
+        if (document.querySelector("style[" + STYLE_ATTR + "='true']")) {
             return;
         }
         var style = document.createElement("style");
@@ -420,35 +434,50 @@ enum CineJoyWebScripts {
             "html, body { background-color: rgb(5, 5, 5) !important; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }" +
             "button, a, input, textarea, select { touch-action: manipulation; }" +
             "input, textarea, select { font-size: 16px !important; }" +
-            "[data-cj-hud-chrome=\"1\"] { transition: opacity 180ms ease !important; }" +
-            "html." + WATCH_CLASS + "." + HUD_HIDDEN_CLASS + " [data-cj-hud-chrome=\"1\"] { opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }";
+            "[data-cj-hud-chrome='1'] { transition: opacity 180ms ease !important; }" +
+            "html." + WATCH_CLASS + "." + HUD_HIDDEN_CLASS + " [data-cj-hud-chrome='1'] { opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }";
         var target = document.head || document.documentElement;
         if (target) {
             target.appendChild(style);
         }
     }
 
-    function repositionAddMenuForKeyboard() {
-        var menu = document.querySelector(".add-menu");
-        if (!menu) {
-            return;
-        }
-        var active = document.activeElement;
-        var inMenuInput = !!(active && menu.contains(active) && (active.tagName === "INPUT" || active.tagName === "TEXTAREA"));
+    function repositionModalsForKeyboard() {
         var vv = window.visualViewport;
-        if (inMenuInput && vv && vv.height < window.innerHeight * 0.78) {
-            var r = menu.getBoundingClientRect();
-            var topPx = Math.max(16, (vv.height - r.height) / 2) + (vv.offsetTop || 0);
-            menu.style.setProperty("top", Math.round(topPx) + "px", "important");
-            menu.style.setProperty("transform", "translateX(-50%)", "important");
-        } else {
-            menu.style.removeProperty("top");
-            menu.style.removeProperty("transform");
+        var active = document.activeElement;
+        var keyboardOpen = !!(vv && vv.height < window.innerHeight * 0.78);
+        var isTextFocus = !!(active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA"));
+
+        var menu = document.querySelector(".add-menu");
+        if (menu) {
+            if (isTextFocus && menu.contains(active) && keyboardOpen) {
+                var r = menu.getBoundingClientRect();
+                var topPx = Math.max(16, (vv.height - r.height) / 2) + (vv.offsetTop || 0);
+                menu.style.setProperty("top", Math.round(topPx) + "px", "important");
+                menu.style.setProperty("transform", "translateX(-50%)", "important");
+            } else {
+                menu.style.removeProperty("top");
+                menu.style.removeProperty("transform");
+            }
+        }
+
+        var loginBackdrop = document.querySelector(".login-backdrop");
+        if (loginBackdrop) {
+            if (isTextFocus && loginBackdrop.contains(active) && keyboardOpen) {
+                var kbPad = Math.max(12, Math.round(window.innerHeight - vv.height - (vv.offsetTop || 0)));
+                loginBackdrop.style.setProperty("padding-bottom", kbPad + "px", "important");
+            } else {
+                loginBackdrop.style.removeProperty("padding-bottom");
+            }
         }
     }
 
     function isWatchRoute() {
         return location.pathname.indexOf("/watch/") !== -1;
+    }
+
+    function isVideoActivelyPlayable(vid) {
+        return !!(vid && !vid.error && (vid.videoWidth > 0 || vid.readyState >= 2));
     }
 
     function postBridgeMessage(payload) {
@@ -551,7 +580,7 @@ enum CineJoyWebScripts {
             return;
         }
         var vid = document.querySelector("video");
-        if (!vid || vid.paused) {
+        if (!isVideoActivelyPlayable(vid) || vid.paused) {
             return;
         }
         markHudChrome();
@@ -564,7 +593,7 @@ enum CineJoyWebScripts {
             return;
         }
         var vid = document.querySelector("video");
-        if (vid && vid.paused) {
+        if (!isVideoActivelyPlayable(vid) || vid.paused) {
             return;
         }
         hudTimer = setTimeout(hideHud, HUD_AUTO_HIDE_MS);
@@ -580,8 +609,16 @@ enum CineJoyWebScripts {
         vid.playsInline = true;
         if (boundVid !== vid) {
             boundVid = vid;
-            vid.addEventListener("play", scheduleHide);
-            vid.addEventListener("playing", scheduleHide);
+            vid.addEventListener("loadeddata", refresh);
+            vid.addEventListener("error", refresh);
+            vid.addEventListener("play", function() {
+                refresh();
+                scheduleHide();
+            });
+            vid.addEventListener("playing", function() {
+                refresh();
+                scheduleHide();
+            });
             vid.addEventListener("pause", function() {
                 clearTimer();
                 document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
@@ -605,21 +642,29 @@ enum CineJoyWebScripts {
     function refresh() {
         ensureViewportMeta();
         injectSafeAreaAndHudStyles();
-        repositionAddMenuForKeyboard();
+        repositionModalsForKeyboard();
         var onWatch = isWatchRoute();
-        reportRouteState(onWatch);
         syncWatchGuardTimer(onWatch);
         if (onWatch) {
-            document.documentElement.classList.add(WATCH_CLASS);
-            markHudChrome();
             var vid = document.querySelector("video");
             if (vid) {
                 applyVideoHardwareAttributes(vid);
+            }
+            var playable = isVideoActivelyPlayable(vid);
+            reportRouteState(playable);
+            if (playable) {
+                document.documentElement.classList.add(WATCH_CLASS);
+                markHudChrome();
                 if (!vid.paused && !hudTimer && !document.documentElement.classList.contains(HUD_HIDDEN_CLASS)) {
                     scheduleHide();
                 }
+            } else {
+                clearTimer();
+                document.documentElement.classList.remove(WATCH_CLASS);
+                document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
             }
         } else {
+            reportRouteState(false);
             clearTimer();
             document.documentElement.classList.remove(WATCH_CLASS);
             document.documentElement.classList.remove(HUD_HIDDEN_CLASS);
@@ -658,15 +703,15 @@ enum CineJoyWebScripts {
     }, true);
 
     document.addEventListener("focusin", function() {
-        setTimeout(repositionAddMenuForKeyboard, 80);
+        setTimeout(repositionModalsForKeyboard, 80);
     }, true);
     document.addEventListener("focusout", function() {
-        setTimeout(repositionAddMenuForKeyboard, 120);
+        setTimeout(repositionModalsForKeyboard, 120);
     }, true);
 
     if (window.visualViewport) {
-        window.visualViewport.addEventListener("resize", repositionAddMenuForKeyboard);
-        window.visualViewport.addEventListener("scroll", repositionAddMenuForKeyboard);
+        window.visualViewport.addEventListener("resize", repositionModalsForKeyboard);
+        window.visualViewport.addEventListener("scroll", repositionModalsForKeyboard);
     }
 
     if (window.history) {
